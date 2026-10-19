@@ -171,9 +171,9 @@ grep -q "^ControlPort" "$TOR_CONF" && sed -i 's/^ControlPort.*/ControlPort 0/' "
 
 if [ "$WARP_AVAILABLE" = "1" ]; then
     log "Configuring WARP..."
-    warp-cli registration new 2>/dev/null || true
-    warp-cli mode proxy 2>/dev/null || true
-    warp-cli proxy port 40000 2>/dev/null || true
+    warp-cli --accept-tos registration new 2>/dev/null || true
+    warp-cli --accept-tos mode proxy 2>/dev/null || true
+    warp-cli --accept-tos proxy port 40000 2>/dev/null || true
 fi
 
 log "Starting services..."
@@ -184,7 +184,7 @@ if [ "$WARP_AVAILABLE" = "1" ]; then
     systemctl enable warp-svc 2>/dev/null || true
     systemctl restart warp-svc 2>/dev/null || true
     sleep 2
-    warp-cli connect 2>/dev/null || true
+    warp-cli --accept-tos connect 2>/dev/null || true
 fi
 
 # --- Generate WireGuard keypair ---
