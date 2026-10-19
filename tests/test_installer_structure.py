@@ -461,6 +461,31 @@ class DnsPreservationTests(unittest.TestCase):
         self.assertIn("WARP_STATE_DIR/resolvers", UNINSTALL_SRC)
 
 
+class TokenPromptTests(unittest.TestCase):
+    """The token is shown as it is typed, so it can be checked and corrected.
+
+    A masked prompt cannot be: the commonest failure here is a token pasted
+    with a character missing, and a masked prompt turns that into "the
+    server refused it" and sends people looking at the wrong thing.
+    """
+
+    def test_the_token_prompt_is_not_masked(self):
+        prompt = next((ln for ln in SRC.splitlines() if "API token" in ln and "read" in ln),
+                      None)
+        self.assertIsNotNone(prompt, "the token prompt was not found")
+        self.assertNotRegex(prompt, r"read\s+-\w*s", "the token prompt is masked")
+
+    def test_the_token_is_read_from_the_terminal_not_a_pipe(self):
+        """The installer is run as `curl ... | bash`, so stdin is the script
+        itself: the token has to come from the terminal."""
+        prompt = next((ln for ln in SRC.splitlines() if "API token" in ln and "read" in ln),
+                      None)
+        self.assertIn("</dev/tty", prompt or "")
+
+    def test_an_empty_token_is_refused(self):
+        self.assertIn('if [ -z "$API_TOKEN" ]; then', SRC)
+
+
 class UninstallerTests(unittest.TestCase):
     """uninstall.sh has to leave the machine as it found it.
 

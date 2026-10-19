@@ -55,7 +55,14 @@ if [ -z "$API_TOKEN" ]; then
     echo "  You need an API token to connect this node."
     echo "  Get one from your hub admin, then paste it here."
     echo ""
-    read -rsp "  Paste your API token: " API_TOKEN </dev/tty
+    # Shown as it is typed, not masked. A masked prompt cannot be checked or
+    # corrected, and the commonest failure here is a token pasted with a
+    # character missing or an extra one - which a masked prompt turns into
+    # "the server refused it" and sends you looking at the wrong thing. The
+    # token is bound to a single node and is about to be stored on this
+    # machine anyway, so there is nothing here that the screen does not
+    # already hold.
+    read -r -p "  Paste your API token: " API_TOKEN </dev/tty
     echo ""
     if [ -z "$API_TOKEN" ]; then
         err "No token provided. Exiting."
