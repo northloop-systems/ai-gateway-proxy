@@ -107,9 +107,13 @@ log "WireGuard interface and its firewall rules removed"
 for unit in proxy-socks5 proxy-tor-redirect proxy-warp-redirect; do
     systemctl disable --now "$unit" 2>/dev/null || true
 done
+systemctl disable --now proxy-tunnel-watchdog.timer 2>/dev/null || true
 rm -f /etc/systemd/system/proxy-socks5.service \
       /etc/systemd/system/proxy-tor-redirect.service \
-      /etc/systemd/system/proxy-warp-redirect.service
+      /etc/systemd/system/proxy-warp-redirect.service \
+      /etc/systemd/system/proxy-tunnel-watchdog.service \
+      /etc/systemd/system/proxy-tunnel-watchdog.timer
+rm -f /usr/local/bin/proxy-tunnel-watchdog.sh
 systemctl daemon-reload 2>/dev/null || true
 log "Services removed"
 

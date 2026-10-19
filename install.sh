@@ -643,6 +643,48 @@ systemctl daemon-reload 2>/dev/null || true
 systemctl enable proxy-socks5 2>/dev/null || true
 systemctl restart proxy-socks5 2>/dev/null || true
 
+# --- Watchdog for the tunnel ---
+# A node that is registered but has no tunnel carries nothing, and the hub
+# cannot tell that apart from a node that is not there. So the node watches
+# its own tunnel and puts it back. This is not belt-and-braces: a real node
+# lost its tunnel's address entirely - wg-quick was stopped by something that
+# was not wg-quick - and the interface was left looking fine and carrying
+# nothing, until somebody noticed the exits were down.
+printf '%s' "$WG_ASSIGNED_IP" > "$PROXY_DIR/wg_ip"
+chmod 644 "$PROXY_DIR/wg_ip"
+printf '%s' "$WG_GATEWAY_PUBKEY" > "$PROXY_DIR/wg_hub_public.key"
+chmod 644 "$PROXY_DIR/wg_hub_public.key"
+if [ -f "$(dirname "$(readlink -f "$0")")/proxy-tunnel-watchdog.sh" ]; then
+    install -m 0755 "$(dirname "$(readlink -f "$0")")/proxy-tunnel-watchdog.sh" \
+        /usr/local/bin/proxy-tunnel-watchdog.sh
+    cat > /etc/systemd/system/proxy-tunnel-watchdog.service <<WATCHDOG
+[Unit]
+Description=Proxy Node - keep the WireGuard tunnel alive
+After=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxy-tunnel-watchdog.sh
+WATCHDOG
+    cat > /etc/systemd/system/proxy-tunnel-watchdog.timer <<WATCHDOG
+[Unit]
+Description=Check the Proxy Node's WireGuard tunnel
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=proxy-tunnel-watchdog.service
+
+[Install]
+WantedBy=timers.target
+WATCHDOG
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now proxy-tunnel-watchdog.timer 2>/dev/null || true
+else
+    warn "proxy-tunnel-watchdog.sh not found next to this installer; the tunnel will not be watched."
+fi
+
 # --- Verify services ---
 TOR_OK=0; WARP_OK=0; WG_OK=0; SOCKS_OK=0
 systemctl is-active --quiet proxy-tor-redirect && TOR_OK=1
