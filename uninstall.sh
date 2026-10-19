@@ -1,33 +1,19 @@
 #!/usr/bin/env bash
-# proxy-node uninstaller
+# ai-gateway-proxy uninstaller.
 #
-# Puts the machine back the way it was:
-#   - tells the hub the node is leaving, so the hub drops it and tears down
-#     the WireGuard peer instead of keeping a route pointed at a dead node
-#   - brings down the tunnel, which is what removes the firewall rules the
-#     installer added (they are the interface's PostUp/PostDown rules)
-#   - stops and removes the services, the keypair, the proxy account
-#   - restores /etc/tor/torrc from the pristine backup the installer kept
-#
-# It DOES undo what the installer changed about WARP's mode and the machine's
-# resolver, because those belong to the machine rather than to the node.
-#
-# It does NOT remove the WARP registration itself: WARP may have been on the
-# machine before this, and the installer cannot know whether it was the
-# user's WARP or its own. `warp-cli registration delete` removes the
-# registration if you want that too.
+# Puts the machine back the way it was. The work is in the binary, which
+# knows exactly what it installed - but the binary may be the thing that
+# is broken, so this script can also do the job on its own.
 #
 # Usage:
-#   sudo bash uninstall.sh
+#   sudo ./uninstall.sh
 #
-# Optional env vars:
-#   SERVER_HOST  - hub hostname (default: ai-gateway.shuffled-family.com)
-#
+#   - or, to remove a node and have the hub told:
+#   sudo ./uninstall.sh --keep-hub-entry
 set -euo pipefail
 
-SERVER_HOST="${SERVER_HOST:-ai-gateway.shuffled-family.com}"
-SERVER_URL="https://${SERVER_HOST}/v1"
-PROXY_DIR="/opt/proxy-node"
+BINARY_PATH="/usr/local/bin/ai-gateway-proxy"
+STATE_DIR="/opt/proxy-node"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -43,89 +29,95 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# --- 1. Tell the hub the node is leaving -----------------------------------
-# A per-node token may revoke its OWN node and nothing else, so this is the
-# one call the node is allowed to make. Without it the hub keeps a route
-# pointed at an address that no longer answers, and keeps the node's entry
-# (and its SOCKS password) until an operator notices.
-if [ -f "$PROXY_DIR/token" ] && [ -f "$PROXY_DIR/node_name" ]; then
-    TOKEN=$(cat "$PROXY_DIR/token")
-    NODE_NAME=$(cat "$PROXY_DIR/node_name")
-    CURL_AUTH=$(mktemp)
-    chmod 600 "$CURL_AUTH"
-    trap 'rm -f "${CURL_AUTH:-}"' EXIT
-    printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$CURL_AUTH"
-    CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 15 \
-        --config "$CURL_AUTH" -X DELETE \
-        "$SERVER_URL/proxy/nodes/node-${NODE_NAME}" 2>/dev/null || echo "000")
-    case "$CODE" in
-        200) log "Hub notified: node ${NODE_NAME} deregistered" ;;
-        404) warn "Hub did not know this node (already gone?)" ;;
-        000) warn "Could not reach the hub; it will notice the node is dead" ;;
-        *)   warn "Hub returned HTTP ${CODE}; revoke the node by hand if it stays" ;;
+KEEP_HUB_ENTRY=0
+for arg in "$@"; do
+    case "$arg" in
+        --keep-hub-entry) KEEP_HUB_ENTRY=1 ;;
+        --help|-h)
+            echo "Usage: uninstall.sh [--keep-hub-entry]"
+            echo "  --keep-hub-entry  do not tell the hub the node is leaving"
+            exit 0 ;;
+        *) err "Unknown argument: $arg"; exit 1 ;;
     esac
-else
-    warn "No stored token found; the hub still has this node registered."
-    warn "Revoke it with: curl -X DELETE -H \"Authorization: Bearer <token>\" \\"
-    warn "  ${SERVER_URL}/proxy/nodes/node-<name>"
-fi
-
-# --- 2. Bring the tunnel down ------------------------------------------------
-# This is what removes the firewall rules: they are wg-quick's PostUp/PostDown
-# rules, so the interface has to go down while its config is still in place.
-#
-# No "is the unit installed?" test guards the systemctl call: a test built on a
-# pipeline (systemctl ... | grep -q) is a trap under `set -o pipefail`, because
-# grep -q exits at the first match, systemctl takes a SIGPIPE, and the whole
-# pipeline reports failure - so the tunnel was never stopped and its PostDown
-# never ran, leaving the firewall rules behind. Stopping a unit that does not
-# exist is a no-op, so just do it.
-if command -v systemctl >/dev/null; then
-    systemctl disable --now wg-quick@wg0 2>/dev/null || true
-fi
-if ip link show wg0 >/dev/null 2>&1; then
-    ip link delete wg0 2>/dev/null || true
-fi
-
-# Belt and braces: remove the rules explicitly as well. PostDown normally does
-# it, but an interface deleted by hand, or a failed unit shutdown, leaves them
-# behind - and a stale DROP rule on a name that no longer exists is exactly
-# the kind of leftover a node owner should not inherit.
-for rule in \
-    "iptables -D INPUT -i wg0 -p tcp --dport 1080 -s 10.200.0.1 -j ACCEPT" \
-    "iptables -D INPUT -i wg0 -p tcp --dport 9050 -s 10.200.0.1 -j ACCEPT" \
-    "iptables -D INPUT -i wg0 -p tcp --dport 40000 -s 10.200.0.1 -j ACCEPT" \
-    "iptables -D INPUT -i wg0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" \
-    "iptables -D INPUT -i wg0 -j DROP"
-do
-    # shellcheck disable=SC2086
-    $rule 2>/dev/null || true
 done
+
+# --- Prefer the binary ------------------------------------------------------
+# It knows what it installed, so its version of this is the careful one.
+if [ -x "$BINARY_PATH" ]; then
+    if [ "$KEEP_HUB_ENTRY" = "1" ]; then
+        "$BINARY_PATH" uninstall --keep-hub-entry
+    else
+        "$BINARY_PATH" uninstall
+    fi
+    STATUS=$?
+    if [ $STATUS -eq 0 ]; then
+        log "Uninstall complete."
+        exit 0
+    fi
+    warn "The binary's uninstall failed; finishing by hand."
+fi
+
+# --- By hand -----------------------------------------------------------------
+# The binary may be gone, or may be what is broken. Either way the machine
+# has to come back.
+log "Removing the node by hand."
+
+NODE_NAME=""
+[ -f "$STATE_DIR/node_name" ] && NODE_NAME=$(cat "$STATE_DIR/node_name" 2>/dev/null || true)
+
+if [ -n "$NODE_NAME" ] && [ "$KEEP_HUB_ENTRY" = "0" ] && [ -f "$STATE_DIR/token" ]; then
+    TOKEN=$(cat "$STATE_DIR/token" 2>/dev/null || true)
+    if [ -n "$TOKEN" ] && command -v curl >/dev/null 2>&1; then
+        CURL_AUTH=$(mktemp)
+        chmod 600 "$CURL_AUTH"
+        trap 'rm -f "${CURL_AUTH:-}"' EXIT
+        printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$CURL_AUTH"
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 15 --config "$CURL_AUTH" \
+            -X DELETE "https://${SERVER_HOST:-ai-gateway.shuffled-family.com}/v1/proxy/nodes/node-${NODE_NAME}" \
+            2>/dev/null || echo "000")
+        case "$CODE" in
+            200) log "Hub notified: node ${NODE_NAME} deregistered" ;;
+            404) warn "Hub did not know this node (already gone?)" ;;
+            000) warn "Could not reach the hub; the node is still registered there" ;;
+            *)   warn "The hub refused the deregistration (HTTP $CODE)" ;;
+        esac
+    fi
+fi
+
+# The tunnel comes down WITH its configuration still in place: the firewall
+# rules are wg-quick's PostDown rules, and they only go away if the
+# interface is brought down while the config is there.
+if command -v wg-quick >/dev/null 2>&1; then
+    wg-quick down wg0 2>/dev/null || true
+fi
+# ...and the rules are removed explicitly as well, in case the shutdown was
+# not clean.
+if command -v iptables >/dev/null 2>&1; then
+    for port in 1080 9050 40000; do
+        iptables -D INPUT -i wg0 -p tcp --dport "$port" -s 10.200.0.1 -j ACCEPT 2>/dev/null || true
+    done
+    iptables -D INPUT -i wg0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -i wg0 -j DROP 2>/dev/null || true
+fi
 log "WireGuard interface and its firewall rules removed"
 
-# --- 3. Services -------------------------------------------------------------
-for unit in proxy-socks5 proxy-tor-redirect proxy-warp-redirect; do
+for unit in proxy-socks5 proxy-tor-redirect proxy-warp-redirect proxy-tunnel-watchdog.timer proxy-tunnel-watchdog.service; do
     systemctl disable --now "$unit" 2>/dev/null || true
 done
-systemctl disable --now proxy-tunnel-watchdog.timer 2>/dev/null || true
 rm -f /etc/systemd/system/proxy-socks5.service \
       /etc/systemd/system/proxy-tor-redirect.service \
       /etc/systemd/system/proxy-warp-redirect.service \
       /etc/systemd/system/proxy-tunnel-watchdog.service \
       /etc/systemd/system/proxy-tunnel-watchdog.timer
-rm -f /usr/local/bin/proxy-tunnel-watchdog.sh
 systemctl daemon-reload 2>/dev/null || true
 log "Services removed"
 
-# --- 4. Files and the proxy account -----------------------------------------
 rm -f /etc/wireguard/wg0.conf
-rm -rf "$PROXY_DIR"
+rm -rf "$STATE_DIR"
 userdel proxysocks 2>/dev/null || true
 log "Keypair, proxy files and the proxysocks account removed"
 
-# --- 5. Restore torrc --------------------------------------------------------
-# The installer keeps the pristine file as torrc.bak and never overwrites it
-# with an already-modified copy, so this always restores the original.
+# The pristine torrc, never an already-modified one.
 if [ -f /etc/tor/torrc.bak ]; then
     cp -a /etc/tor/torrc.bak /etc/tor/torrc
     systemctl restart tor 2>/dev/null || true
@@ -134,13 +126,9 @@ else
     warn "No /etc/tor/torrc.bak found; torrc left as it is"
 fi
 
-# --- 6. Give WARP and the resolver back -------------------------------------
-# The installer flipped WARP into proxy mode and may have had to put the
-# machine's resolver back by hand. Both belong to the machine, not to the
-# node, so the uninstaller returns them.
-WARP_STATE_DIR=/etc/proxy-node-warp
-if [ -f "$WARP_STATE_DIR/mode" ] && command -v warp-cli &>/dev/null; then
-    PRE_MODE=$(head -1 "$WARP_STATE_DIR/mode")
+# WARP goes back to the mode it had before, and the resolver with it.
+if [ -f /etc/proxy-node-warp/mode ] && command -v warp-cli >/dev/null 2>&1; then
+    PRE_MODE=$(head -1 /etc/proxy-node-warp/mode)
     case "$(printf '%s' "$PRE_MODE" | tr 'A-Z' 'a-z')" in
         *proxy*)
             warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
@@ -158,14 +146,14 @@ if [ -f "$WARP_STATE_DIR/mode" ] && command -v warp-cli &>/dev/null; then
             ;;
     esac
 fi
-if [ -f "$WARP_STATE_DIR/resolvers" ]; then
-    RESOLVERS=$(cat "$WARP_STATE_DIR/resolvers")
-    if [ -n "$RESOLVERS" ] && [ ! -L /etc/resolv.conf ]; then
+if [ -f /etc/proxy-node-warp/resolvers ] && [ ! -L /etc/resolv.conf ]; then
+    RESOLVERS=$(cat /etc/proxy-node-warp/resolvers)
+    if [ -n "$RESOLVERS" ]; then
         printf 'nameserver %s\n' $RESOLVERS > /etc/resolv.conf
         log "System resolver restored"
     fi
 fi
-rm -rf "$WARP_STATE_DIR"
+rm -rf /etc/proxy-node-warp
 
 log "Uninstall complete."
 log "WARP's registration is still on the machine: warp-cli registration delete removes it."

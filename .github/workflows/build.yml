@@ -1,0 +1,102 @@
+name: build
+
+# Builds the binary and publishes it.
+#
+# The install script pins the SHA-256 of the binary it installs, so a
+# release is not finished until that pin moves - which is why the job opens
+# a pull request with the new hash rather than pushing it. The pin is the
+# trust anchor: it is what makes "this is the binary the script was
+# written for" checkable, and it should only move when a person says so.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  MUSL: x86_64-unknown-linux-musl
+  GNULL: aarch64-unknown-linux-gnu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustup target add $MUSL $GNULL
+          rustc --version && cargo --version
+
+      - name: Check the formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          # The musl build is fully static: no glibc, no interpreter, one
+          # file that runs anywhere a Linux kernel does.
+          cargo build --release --target $MUSL
+          cp target/$MUSL/release/ai-gateway-proxy dist/ai-gateway-proxy-linux-amd64
+          cargo build --release --target $GNULL
+          cp target/$GNULL/release/ai-gateway-proxy dist/ai-gateway-proxy-linux-arm64
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ai-gateway-proxy-linux-* > SHA256SUMS
+          for f in ai-gateway-proxy-linux-*; do
+            sha256sum "$f" | cut -d' ' -f1 > "$f.sha256"
+          done
+          cat SHA256SUMS
+
+      - name: Publish the release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: v${{ github.run_number }}
+          files: |
+            dist/ai-gateway-proxy-linux-amd64
+            dist/ai-gateway-proxy-linux-amd64.sha256
+            dist/ai-gateway-proxy-linux-arm64
+            dist/ai-gateway-proxy-linux-arm64.sha256
+            dist/SHA256SUMS
+          body: |
+            The node binary. The installer checks the SHA-256 pinned in
+            `install.sh` before it runs anything, so the checksum files here
+            are for convenience, not what the installer relies on.
+
+      - name: Propose the new pin for the installer
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          HASH=$(sha256sum dist/ai-gateway-proxy-linux-amd64 | cut -d' ' -f1)
+          VERSION="1.0.0"
+          {
+            echo "The amd64 binary for v${VERSION}, and its checksum."
+            echo
+            echo "The installer fetches the binary from the hub's domain first"
+            echo "and the release as a mirror, and refuses to run anything whose"
+            echo "checksum is not the one pinned below."
+          } > /tmp/note.md
+          sed -i "s|^SHA256=.*|SHA256=\"${HASH}\"|" install.sh
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git checkout -b release/pin-${{ github.run_number }}
+          git add install.sh
+          git commit -m "installer: pin the v${VERSION} binary"
+          git push -u origin release/pin-${{ github.run_number }}
+          gh pr create --title "Pin the v${VERSION} binary" --body-file /tmp/note.md || true

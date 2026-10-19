@@ -1,36 +1,49 @@
 #!/usr/bin/env bash
-# proxy-node installer
+# ai-gateway-proxy installer.
 #
-# Turns a machine into an egress node. Each node provides up to 3 egress IPs:
-#   1. Cloudflare WARP  -> WARP exit IP
-#   2. Tor             -> Tor exit IP
-#   3. Direct          -> the node's own public IP
+# This script does three things and nothing else:
 #
-# All three are reachable from the hub only over the node's WireGuard IP, not
-# on localhost: the direct SOCKS5 listens on <wg-ip>:1080, Tor on <wg-ip>:9050
-# and WARP on <wg-ip>:40000 (Tor/WARP stay bound to localhost and are reached
-# through socat redirects).
+#   1. fetches the ai-gateway-proxy binary
+#   2. checks that binary against a pinned SHA-256
+#   3. runs it
 #
-# The connection to the hub uses WireGuard — an authenticated, encrypted VPN.
-# NO SSH, NO chisel. The tunnel itself uses a keypair (no shared secret), but
-# the direct proxy is protected by a generated username/password.
+# The work is in the binary, which is one file with no dependencies at all -
+# so the thing that ends up running as root is something you can read in
+# one sitting, and there is no second file for it to go and fetch.
+#
+# The checksum is PINNED in this script, not fetched alongside the binary.
+# A checksum published next to the file it checks proves only that the two
+# arrived together; a checksum that lives here proves the binary is the
+# one this script was written for. Someone who can change the release can
+# change this script too - so if that matters to you, read the script
+# before you run it, which is the whole reason it is a script.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/northloop-systems/ai-gateway-proxy/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/northloop-systems/ai-gateway-proxy/main/install.sh | sudo bash
 #
-# Optional env vars:
-#   API_TOKEN        - your API key (required, prompted if missing)
-#   SERVER_HOST      - server hostname (default: ai-gateway.shuffled-family.com)
-#   WG_ENDPOINT      - WireGuard endpoint (default: <host>:51820)
-#   NODE_NAME        - friendly name for this node (default: hostname)
-#
+#   - or, to install a binary you have already downloaded and checked:
+#   sudo ./install.sh --local ./ai-gateway-proxy
 set -euo pipefail
 
-NODE_NAME="${NODE_NAME:-$(hostname)}"
-API_TOKEN="${API_TOKEN:-}"
-SERVER_HOST="${SERVER_HOST:-ai-gateway.shuffled-family.com}"
-WG_ENDPOINT="${WG_ENDPOINT:-${SERVER_HOST}:51820}"
-SERVER_URL="https://${SERVER_HOST}/v1"
+VERSION="1.0.0"
+REPO="northloop-systems/ai-gateway-proxy"
+BINARY_NAME="ai-gateway-proxy"
+INSTALL_PATH="/usr/local/bin/ai-gateway-proxy"
+STATE_DIR="/opt/proxy-node"
+
+# Where the binary is fetched from, in the order it is tried. The first
+# one is the hub's own domain, so a friend is not pulled through GitHub to
+# lend a machine; the release is the mirror, for when the domain is having
+# a bad day.
+MIRRORS=(
+    "https://ai.shuffled-family.com/proxy-node"
+    "https://github.com/${REPO}/releases/download/v${VERSION}"
+)
+
+# The SHA-256 of the binary this version of the script installs. A mismatch
+# stops the install: a binary that is not the one this script was written
+# for is a binary nobody has read.
+SHA256="__SHA256__"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -46,673 +59,120 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-if [ -z "$API_TOKEN" ]; then
+LOCAL_BINARY=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --local) LOCAL_BINARY="$2"; shift 2 ;;
+        --version) echo "$VERSION"; exit 0 ;;
+        --help|-h)
+            echo "Usage: install.sh [--local ./ai-gateway-proxy]"
+            echo "  --local   install a binary you already have instead of downloading one"
+            exit 0 ;;
+        *) err "Unknown argument: $1"; exit 1 ;;
+    esac
+done
+
+# --- Work out the platform ---------------------------------------------------
+case "$(uname -m)" in
+    x86_64|amd64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    *) err "Unsupported architecture: $(uname -m). The binary is published for amd64 and arm64."; exit 1 ;;
+esac
+ASSET="${BINARY_NAME}-linux-${ARCH}"
+
+# --- Get the binary ----------------------------------------------------------
+WORKDIR=$(mktemp -d)
+trap 'rm -rf "$WORKDIR"' EXIT
+BINARY_PATH="$WORKDIR/$BINARY_NAME"
+
+if [ -n "$LOCAL_BINARY" ]; then
+    if [ ! -f "$LOCAL_BINARY" ]; then
+        err "No such file: $LOCAL_BINARY"
+        exit 1
+    fi
+    log "Using the binary you gave me: $LOCAL_BINARY"
+    cp "$LOCAL_BINARY" "$BINARY_PATH"
+else
+    if ! command -v curl >/dev/null 2>&1; then
+        err "curl is needed to download the binary. Install it and run this again."
+        exit 1
+    fi
+    DOWNLOADED=""
+    for mirror in "${MIRRORS[@]}"; do
+        log "Downloading ${BINARY_NAME} ${VERSION} (${ASSET}) from ${mirror}..."
+        if curl -fsSL -o "$BINARY_PATH" "${mirror}/${ASSET}"; then
+            DOWNLOADED="$mirror"
+            break
+        fi
+        rm -f "$BINARY_PATH"
+    done
+    if [ -z "$DOWNLOADED" ]; then
+        err "Could not download ${ASSET} from any of them:"
+        for mirror in "${MIRRORS[@]}"; do err "  ${mirror}"; done
+        err "  You can also install a binary you have already: "
+        err "    sudo ./install.sh --local ./ai-gateway-proxy"
+        exit 1
+    fi
+    log "Downloaded from ${DOWNLOADED}"
+fi
+
+# --- Check it ---------------------------------------------------------------
+# The binary is what runs as root, so this is the one moment where it
+# matters that the file is the one we expect.
+if [ "$SHA256" = "__SHA256__" ]; then
+    err "This script has no pinned checksum for the binary."
+    err "  That is a bug in the installer, not something to work around."
+    exit 1
+fi
+if ! command -v sha256sum >/dev/null 2>&1; then
+    err "sha256sum is needed to check the binary. Install coreutils and run this again."
+    exit 1
+fi
+ACTUAL=$(sha256sum "$BINARY_PATH" | cut -d' ' -f1)
+if [ "$ACTUAL" != "$SHA256" ]; then
+    err "The binary's checksum does not match."
+    err "  expected: $SHA256"
+    err "  got:      $ACTUAL"
+    err "  This binary is not the one this script was written for, so it is not"
+    err "  being run. If you trust it anyway, install it by hand:"
+    err "    sudo install -m 0755 $BINARY_PATH $INSTALL_PATH"
+    exit 1
+fi
+log "Checksum verified: $ACTUAL"
+
+# --- Put it where it belongs -------------------------------------------------
+install -m 0755 "$BINARY_PATH" "$INSTALL_PATH"
+log "Installed $INSTALL_PATH"
+
+# --- Hand over --------------------------------------------------------------
+# The token is prompted for here rather than in the binary, so it is shown
+# as it is typed: a masked prompt cannot be checked, and the commonest
+# failure is a token pasted with a character missing.
+if [ -z "${AI_GATEWAY_PROXY_TOKEN:-}" ]; then
     echo ""
     echo "  =========================================="
-    echo "   Proxy Node Installer (WireGuard)"
+    echo "   Proxy Node Installer"
     echo "  =========================================="
     echo ""
     echo "  You need an API token to connect this node."
     echo "  Get one from your hub admin, then paste it here."
     echo ""
-    # Shown as it is typed, not masked. A masked prompt cannot be checked or
-    # corrected, and the commonest failure here is a token pasted with a
-    # character missing or an extra one - which a masked prompt turns into
-    # "the server refused it" and sends you looking at the wrong thing. The
-    # token is bound to a single node and is about to be stored on this
-    # machine anyway, so there is nothing here that the screen does not
-    # already hold.
-    read -r -p "  Paste your API token: " API_TOKEN </dev/tty
+    read -r -p "  Paste your API token: " AI_GATEWAY_PROXY_TOKEN </dev/tty
     echo ""
-    if [ -z "$API_TOKEN" ]; then
+    if [ -z "$AI_GATEWAY_PROXY_TOKEN" ]; then
         err "No token provided. Exiting."
         exit 1
     fi
 fi
 
-# --- Verify connectivity ---
-# The token goes in a 0600 curl config file, never on the command line (ps).
-CURL_AUTH=$(mktemp)
-chmod 600 "$CURL_AUTH"
-trap 'rm -f "${CURL_AUTH:-}"' EXIT
-printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" > "$CURL_AUTH"
-log "Verifying connectivity..."
-# Preflight against a /v1/proxy path, NOT /v1/models. A per-node token is scoped
-# to /v1/proxy and is refused with 403 everywhere else, so probing it against a
-# normal gateway endpoint fails for every correct token - the installer rejects
-# a credential it was just handed. /v1/proxy/whoami is in scope and answers
-# only about the caller.
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 15 \
-    --config "$CURL_AUTH" \
-    "$SERVER_URL/proxy/whoami" 2>/dev/null || echo "000")
-if [ "$HTTP_CODE" != "200" ]; then
-    err "Cannot reach server (HTTP $HTTP_CODE). Check API_TOKEN and network."
-    exit 1
-fi
-log "Server OK"
+export AI_GATEWAY_PROXY_TOKEN
+"$INSTALL_PATH" install "$@"
+STATUS=$?
 
-# A per-node token is bound to ONE node name, and the hub refuses a
-# registration under any other. The node's own hostname is almost never that
-# name, so guessing it is a dead end - but the hub already knows which node
-# the token belongs to, and says so. Take the name from there, so pasting a
-# token is all anyone has to do.
-BOUND_NODE=$(curl -s -m 15 --config "$CURL_AUTH" \
-    "$SERVER_URL/proxy/whoami" 2>/dev/null \
-    | python3 -c "import json,sys; print(json.load(sys.stdin).get('bound_node') or '')" 2>/dev/null || echo "")
-if [ -n "$BOUND_NODE" ] && [ "$NODE_NAME" = "$(hostname)" ]; then
-    NODE_NAME="$BOUND_NODE"
-    log "This token is bound to node '$NODE_NAME'"
+if [ $STATUS -ne 0 ]; then
+    err "The install did not finish. Nothing was rolled back - the node is"
+    err "  safe to re-run, and re-running is what the next step should be."
+    exit $STATUS
 fi
 
-# --- Detect OS ---
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo "$ID"
-    elif [ -f /etc/debian_version ]; then
-        echo "debian"
-    elif [ -f /etc/redhat-release ]; then
-        echo "rhel"
-    else
-        err "Unsupported OS"
-        exit 1
-    fi
-}
-OS=$(detect_os)
-log "OS: $OS"
-
-# --- Install packages (WireGuard) ---
-install_packages() {
-    case "$OS" in
-        ubuntu|debian)
-            apt-get update -qq
-            apt-get install -y -qq tor python3 curl wireguard-tools iptables socat
-            ;;
-        fedora)
-            dnf install -y -q tor python3 curl wireguard-tools iptables-nft socat
-            ;;
-        centos|rhel|rocky|almalinux)
-            yum install -y -q tor python3 curl wireguard-tools iptables-nft socat
-            ;;
-        arch|manjaro)
-            pacman -Sy --noconfirm tor python curl wireguard-tools iptables-nft socat
-            ;;
-        *)
-            err "Unsupported OS: $OS"
-            exit 1
-            ;;
-    esac
-}
-log "Installing packages (WireGuard)..."
-install_packages
-
-if ! command -v iptables &>/dev/null; then
-    err "iptables still not found after package install. Install iptables before continuing."
-    exit 1
-fi
-
-# --- Install Cloudflare WARP ---
-install_warp() {
-    if command -v warp-cli &>/dev/null; then
-        log "WARP already installed"
-        return 0
-    fi
-    case "$OS" in
-        ubuntu|debian)
-            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null
-            . /etc/os-release
-            echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $VERSION_CODENAME main" > /etc/apt/sources.list.d/cloudflare-client.list
-            apt-get update -qq
-            apt-get install -y -qq cloudflare-warp
-            ;;
-        *)
-            warn "WARP not available for $OS. Skipping (only Tor + Direct)."
-            return 1
-            ;;
-    esac
-}
-WARP_AVAILABLE=0
-if install_warp; then
-    WARP_AVAILABLE=1
-    log "WARP installed"
-fi
-
-# --- Configure Tor ---
-log "Configuring Tor..."
-TOR_CONF="/etc/tor/torrc"
-# Keep the FIRST backup we ever take (the pristine pre-install torrc), so a
-# re-run can't overwrite the user's original with our already-modified copy.
-if [ ! -f "$TOR_CONF.bak" ]; then
-    cp -a "$TOR_CONF" "$TOR_CONF.bak" 2>/dev/null || true
-fi
-grep -q "^SocksPort" "$TOR_CONF" && sed -i 's/^SocksPort.*/SocksPort 127.0.0.1:9050/' "$TOR_CONF" || echo "SocksPort 127.0.0.1:9050" >> "$TOR_CONF"
-grep -q "^SocksPolicy" "$TOR_CONF" || { echo "SocksPolicy accept 127.0.0.1" >> "$TOR_CONF"; echo "SocksPolicy reject *" >> "$TOR_CONF"; }
-grep -q "^ControlPort" "$TOR_CONF" && sed -i 's/^ControlPort.*/ControlPort 0/' "$TOR_CONF" || echo "ControlPort 0" >> "$TOR_CONF"
-
-# --- Keep the machine's DNS working across the WARP switch ------------------
-# WARP, in tunnel or DNS mode, is usually the machine's resolver: it puts
-# 100.100.100.100 into the machine's DNS configuration. Switching it to proxy
-# mode takes that resolver away with it, and a node whose DNS is dead can
-# neither reach the hub nor resolve anything else - the install dies on its
-# first request, and the machine is left unable to work at all. Work out what
-# the machine was using before the switch, and put it back afterwards if the
-# switch took it away.
-WARP_STATE_DIR=/etc/proxy-node-warp
-# The resolver file, as a variable so the logic can be exercised against a
-# throwaway file instead of the machine's real one.
-RESOLV_CONF="${RESOLV_CONF:-/etc/resolv.conf}"
-mkdir -p "$WARP_STATE_DIR"
-chmod 0700 "$WARP_STATE_DIR"
-
-warp_current_mode() {
-    warp-cli --accept-tos settings 2>/dev/null \
-        | grep -iE "mode:" | head -1 \
-        | sed -E 's/.*mode:[[:space:]]*//' | tr -d '\r' | awk '{print $1}' || true
-}
-
-# The resolvers the machine can actually use: the ones it has now (minus
-# WARP's own and the loopback), then the ones its connection is configured
-# with, then the ones the link carries, and a public resolver last.
-dns_candidates() {
-    local out
-    out=$(grep -E "^nameserver" "$RESOLV_CONF" 2>/dev/null \
-          | grep -vE "^nameserver (100\.100\.100\.100|127\.)" \
-          | awk '{print $2}' | head -3 | tr '\n' ' ' || true)
-    if [ -z "$out" ] && command -v nmcli &>/dev/null; then
-        out=$(nmcli -t -f ipv4.dns con show --active 2>/dev/null \
-              | head -1 | cut -d: -f2- | tr ',' ' ' || true)
-    fi
-    if [ -z "$out" ] && command -v resolvectl &>/dev/null; then
-        out=$(resolvectl dns --no-pager 2>/dev/null \
-              | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
-              | grep -vE '^(127\.|100\.100\.100\.100)' | head -3 | tr '\n' ' ' || true)
-    fi
-    [ -z "$out" ] && out="1.1.1.1"
-    echo "$out"
-}
-
-dns_works() {
-    timeout 8 getent hosts one.one.one.one >/dev/null 2>&1
-}
-
-# Write the resolvers back into whatever the machine actually reads. A file
-# owned by systemd-resolved is left alone: 127.0.0.53 always answers, and it
-# asks the link rather than that file.
-restore_dns() {
-    local cands="$1" used=0 dev con
-    if [ ! -L "$RESOLV_CONF" ]; then
-        printf 'nameserver %s\n' $cands > "$RESOLV_CONF" || return 1
-        used=1
-    elif command -v resolvectl &>/dev/null; then
-        dev=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1 || true)
-        if [ -n "$dev" ] && resolvectl dns "$dev" $cands >/dev/null 2>&1; then
-            used=1
-        fi
-    fi
-    # NetworkManager writes the file again on the next reconnect, so its own
-    # idea of the resolvers has to be corrected too.
-    if command -v nmcli &>/dev/null; then
-        con=$(nmcli -t -f NAME con show --active 2>/dev/null | head -1 || true)
-        if [ -n "$con" ]; then
-            dev=$(nmcli -t -f DEVICE con show "$con" 2>/dev/null | cut -d: -f2- || true)
-            nmcli con mod "$con" ipv4.dns "$cands" ipv4.ignore-auto-dns yes \
-                >/dev/null 2>&1 || true
-            if [ -n "$dev" ]; then
-                nmcli device reapply "$dev" >/dev/null 2>&1 || true
-            fi
-        fi
-    fi
-    [ "$used" = "1" ]
-}
-
-if [ "$WARP_AVAILABLE" = "1" ]; then
-    log "Configuring WARP..."
-    PRE_WARP_MODE=$(warp_current_mode)
-    [ -n "$PRE_WARP_MODE" ] && printf '%s\n' "$PRE_WARP_MODE" > "$WARP_STATE_DIR/mode"
-    DNS_CANDIDATES=$(dns_candidates)
-    printf '%s\n' "$DNS_CANDIDATES" > "$WARP_STATE_DIR/resolvers"
-    warp-cli --accept-tos registration new 2>/dev/null || true
-    warp-cli --accept-tos mode proxy 2>/dev/null || true
-    warp-cli --accept-tos proxy port 40000 2>/dev/null || true
-fi
-
-log "Starting services..."
-systemctl enable tor 2>/dev/null || true
-systemctl restart tor 2>/dev/null || service tor restart 2>/dev/null || true
-
-if [ "$WARP_AVAILABLE" = "1" ]; then
-    systemctl enable warp-svc 2>/dev/null || true
-    systemctl restart warp-svc 2>/dev/null || true
-    sleep 2
-    warp-cli --accept-tos connect 2>/dev/null || true
-fi
-
-# --- Generate WireGuard keypair ---
-log "Generating WireGuard keypair..."
-PROXY_DIR="/opt/proxy-node"
-if ! id proxysocks &>/dev/null; then
-    useradd -r -s /usr/sbin/nologin proxysocks
-fi
-install -d -m 0750 -o root -g proxysocks "$PROXY_DIR"
-WG_PRIVATE_KEY=$(wg genkey)
-WG_PUBLIC_KEY=$(echo "$WG_PRIVATE_KEY" | wg pubkey)
-echo "$WG_PUBLIC_KEY" > "$PROXY_DIR/wg_public.key"
-chmod 644 "$PROXY_DIR/wg_public.key"
-log "WireGuard keypair generated"
-
-# --- Create authenticated SOCKS5 proxy for direct IP ---
-log "Creating authenticated SOCKS5 proxy for direct IP..."
-SOCKS_USER="proxyuser"
-SOCKS_PASS=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))")
-cat > "$PROXY_DIR/socks5.py" <<PYEOF
-#!/usr/bin/env python3
-"""Authenticated SOCKS5 proxy for direct (node's own) IP egress."""
-import socket, threading, select, sys
-
-LISTEN_HOST = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
-WG_HUB_IP = "10.200.0.1"
-LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 1080
-SOCKS_USER = "${SOCKS_USER}"
-SOCKS_PASS = "${SOCKS_PASS}"
-
-import ipaddress
-
-def _resolve_safe(host, port):
-    if port != 443:
-        return None
-    try:
-        ips = [r[4][0] for r in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
-    except Exception:
-        return None
-    if not ips or not all(ipaddress.ip_address(i).is_global for i in ips):
-        return None
-    return ips[0]
-
-def handle_client(client):
-    try:
-        client.settimeout(30)
-        data = client.recv(262)
-        if not data or data[0] != 5:
-            client.close()
-            return
-        client.send(b'\x05\x02')
-        auth = client.recv(512)
-        if not auth or auth[0] != 1:
-            client.close()
-            return
-        ulen = auth[1]
-        user = auth[2:2+ulen].decode()
-        plen = auth[2+ulen]
-        passwd = auth[3+ulen:3+ulen+plen].decode()
-        if user != SOCKS_USER or passwd != SOCKS_PASS:
-            client.send(b'\x01\x01')
-            client.close()
-            return
-        client.send(b'\x01\x00')
-        data = client.recv(4)
-        if len(data) < 4 or data[1] != 1:
-            client.close()
-            return
-        atyp = data[3]
-        if atyp == 1:
-            addr = socket.inet_ntoa(client.recv(4))
-        elif atyp == 3:
-            ln = client.recv(1)[0]
-            addr = client.recv(ln).decode()
-        elif atyp == 4:
-            addr = socket.inet_ntop(socket.AF_INET6, client.recv(16))
-        else:
-            client.close()
-            return
-        port = int.from_bytes(client.recv(2), 'big')
-        resolved = _resolve_safe(addr, port)
-        if resolved is None:
-            client.send(b'\x05\x02\x00\x01' + socket.inet_aton('0.0.0.0') + (0).to_bytes(2, 'big'))
-            client.close()
-            return
-        try:
-            remote = socket.create_connection((resolved, port), timeout=30)
-            client.send(b'\x05\x00\x00\x01' + socket.inet_aton('0.0.0.0') + (0).to_bytes(2, 'big'))
-            while True:
-                r, _, _ = select.select([client, remote], [], [], 30)
-                if client in r:
-                    d = client.recv(65536)
-                    if not d:
-                        break
-                    remote.sendall(d)
-                if remote in r:
-                    d = remote.recv(65536)
-                    if not d:
-                        break
-                    client.sendall(d)
-        except Exception:
-            try:
-                client.send(b'\x05\x05\x00\x01' + socket.inet_aton('0.0.0.0') + (0).to_bytes(2, 'big'))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    finally:
-        client.close()
-
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind((LISTEN_HOST, LISTEN_PORT))
-s.listen(64)
-MAX_CONNS = 128
-active_conns = 0
-conn_lock = threading.Lock()
-
-def wrapped_handle(cl):
-    global active_conns
-    try:
-        handle_client(cl)
-    finally:
-        with conn_lock:
-            active_conns -= 1
-
-while True:
-    c, addr = s.accept()
-    if addr[0] != WG_HUB_IP:
-        c.close()
-        continue
-    with conn_lock:
-        if active_conns >= MAX_CONNS:
-            c.close()
-            continue
-        active_conns += 1
-    threading.Thread(target=wrapped_handle, args=(c,), daemon=True).start()
-PYEOF
-chmod 644 "$PROXY_DIR/socks5.py"
-
-# --- Register with server (send WireGuard public key) ---
-# WARP's switch to proxy mode can take the machine's resolver with it, and
-# the machine does not find out until it tries to reach the hub and cannot.
-# Check now, put the resolver back if it is gone, and say so plainly if it
-# cannot be fixed - an unreachable hub and a dead resolver look identical
-# from the outside, and only one of them is the installer's fault.
-if ! dns_works; then
-    if [ -n "${DNS_CANDIDATES:-}" ] && restore_dns "$DNS_CANDIDATES" && dns_works; then
-        log "Restored the resolver WARP was providing"
-    else
-        err "This machine cannot resolve names, so the hub is unreachable."
-        err "  Put a working nameserver in /etc/resolv.conf (e.g. 'nameserver 1.1.1.1')"
-        err "  and run this installer again."
-        exit 1
-    fi
-fi
-PUBLIC_IP=$(curl -s -m 10 https://api.ipify.org 2>/dev/null || echo "unknown")
-log "Registering with server (sending WireGuard public key)..."
-REG_RESPONSE=$(WG_PUB="$WG_PUBLIC_KEY" NODE="$NODE_NAME" PUBIP="$PUBLIC_IP" SU="$SOCKS_USER" SP="$SOCKS_PASS" \
-    python3 -c 'import json,os; print(json.dumps({"hostname":os.environ["NODE"],"version":"3.0","wireguard_public_key":os.environ["WG_PUB"],"ports":{"tor":9050,"warp":40000,"direct":1080},"public_ip":os.environ["PUBIP"],"socks_user":os.environ["SU"],"socks_pass":os.environ["SP"]}))' \
-    | curl -s -m 15 -X POST --config "$CURL_AUTH" \
-    -H "Content-Type: application/json" -d @- \
-    "$SERVER_URL/proxy/register" 2>/dev/null || echo '{"status":"error"}')
-
-# A request that never reached the hub, or that the hub refused, must not be
-# reported as a bad public key: those need completely different fixes, and
-# "the server said your key is invalid" sends people looking at their own
-# key instead of at the request. Say which it was, and show the answer.
-if ! echo "$REG_RESPONSE" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
-    err "Could not reach the hub at ${SERVER_URL}/proxy/register."
-    err "  response: ${REG_RESPONSE:0:300}"
-    exit 1
-fi
-REG_STATUS=$(echo "$REG_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
-if [ "$REG_STATUS" != "ok" ]; then
-    err "The hub refused the registration."
-    err "  response: ${REG_RESPONSE:0:300}"
-    err "  The token is bound to one node name; register under that name, or ask"
-    err "  the operator for a token for '$NODE_NAME'."
-    exit 1
-fi
-
-# Extract assigned WireGuard IP and gateway's public key from response
-WG_ASSIGNED_IP=$(echo "$REG_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('wireguard_ip',''))" 2>/dev/null || echo "")
-WG_GATEWAY_PUBKEY=$(echo "$REG_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('wireguard_gateway_public_key',''))" 2>/dev/null || echo "")
-# The hub is the authority on where to reach it, so use the endpoint it
-# advertised. The env var is only the fallback for a hub that did not say.
-# This is what lets the whole install be `curl ... | bash`: the node learns
-# the hub's address from the hub, instead of the operator having to know it
-# and pass it in.
-WG_ADVERTISED_ENDPOINT=$(echo "$REG_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('wireguard_endpoint',''))" 2>/dev/null || echo "")
-WG_GATEWAY_ENDPOINT="${WG_ADVERTISED_ENDPOINT:-$WG_ENDPOINT}"
-
-# --- Validate server-supplied values (prevent config injection) ---
-# Use bash regex (not grep) to match the ENTIRE string, preventing
-# multi-line injection (grep matches line-by-line, allowing embedded newlines).
-if ! [[ "$WG_GATEWAY_PUBKEY" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
-    err "Invalid WireGuard public key from server. Aborting."
-    exit 1
-fi
-if ! [[ "$WG_ASSIGNED_IP" =~ ^10\.200\.0\.([0-9]{1,3})$ ]] || [ "$((10#${BASH_REMATCH[1]}))" -gt 255 ] || [ "$((10#${BASH_REMATCH[1]}))" -lt 2 ]; then
-    err "Invalid WireGuard IP from server. Aborting."
-    exit 1
-fi
-if ! [[ "$WG_GATEWAY_ENDPOINT" =~ ^[a-zA-Z0-9._-]+:[0-9]{1,5}$ ]]; then
-    err "Invalid WireGuard endpoint from server. Aborting."
-    exit 1
-fi
-
-if [ -z "$WG_ASSIGNED_IP" ] || [ -z "$WG_GATEWAY_PUBKEY" ]; then
-    warn "Server did not return WireGuard config. WireGuard tunnel will not be set up."
-    warn "Registration response: [redacted to avoid leaking server-supplied data]"
-    WG_CONFIGURED=0
-else
-    WG_CONFIGURED=1
-    log "Assigned WireGuard IP: $WG_ASSIGNED_IP"
-    log "Gateway WireGuard public key received"
-
-    # --- Persist the credential and node id for the uninstaller ---
-    # The token is kept 0600, in the same directory that already holds the
-    # SOCKS password inside socks5.py, so this adds no new secret to the node.
-    # The uninstaller needs it to tell the hub the node is leaving: a per-node
-    # token may revoke its OWN node, so a node can deregister itself without
-    # the operator having to intervene.
-    install -d -m 0750 -o root -g proxysocks "$PROXY_DIR"
-    printf '%s' "$API_TOKEN" > "$PROXY_DIR/token"
-    chmod 600 "$PROXY_DIR/token"
-    printf '%s' "$NODE_NAME" > "$PROXY_DIR/node_name"
-    chmod 600 "$PROXY_DIR/node_name"
-
-    # --- Configure WireGuard ---
-    log "Configuring WireGuard..."
-    cat > /etc/wireguard/wg0.conf <<WGEOF
-[Interface]
-PrivateKey = $WG_PRIVATE_KEY
-Address = $WG_ASSIGNED_IP/24
-PostUp = iptables -I INPUT 1 -i %i -j DROP
-PostUp = iptables -I INPUT 1 -i %i -p tcp --dport 40000 -s 10.200.0.1 -j ACCEPT
-PostUp = iptables -I INPUT 1 -i %i -p tcp --dport 9050 -s 10.200.0.1 -j ACCEPT
-PostUp = iptables -I INPUT 1 -i %i -p tcp --dport 1080 -s 10.200.0.1 -j ACCEPT
-PostUp = iptables -I INPUT 1 -i %i -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-PostDown = iptables -D INPUT -i %i -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-PostDown = iptables -D INPUT -i %i -p tcp --dport 1080 -s 10.200.0.1 -j ACCEPT
-PostDown = iptables -D INPUT -i %i -p tcp --dport 9050 -s 10.200.0.1 -j ACCEPT
-PostDown = iptables -D INPUT -i %i -p tcp --dport 40000 -s 10.200.0.1 -j ACCEPT
-PostDown = iptables -D INPUT -i %i -j DROP
-
-[Peer]
-PublicKey = $WG_GATEWAY_PUBKEY
-AllowedIPs = 10.200.0.1/32
-Endpoint = $WG_GATEWAY_ENDPOINT
-PersistentKeepalive = 25
-WGEOF
-    chmod 600 /etc/wireguard/wg0.conf
-
-    # --- Start WireGuard ---
-    log "Starting WireGuard..."
-    systemctl enable wg-quick@wg0 2>/dev/null || true
-    if ! systemctl restart wg-quick@wg0; then
-        err "WireGuard failed to start. Check config."
-        exit 1
-    fi
-
-    # --- Redirect WG traffic to localhost Tor/WARP (safe for node owner) ---
-    # Hub connects to WG_IP:9050/40000, redirected to 127.0.0.1
-    # Keeps Tor/WARP bound to localhost (not exposed on public interfaces)
-    # Required, not optional: the firewall opens these ports below, so a
-    # missing socat would leave them open to nothing with no way to tell.
-    if ! command -v socat &>/dev/null; then
-        err "socat not found but is required to expose Tor/WARP to the hub."
-        err "Install socat, or set WARP/Tor aside - the ports are opened either way."
-        exit 1
-    fi
-    {
-        cat > /etc/systemd/system/proxy-tor-redirect.service <<REDIRECT
-[Unit]
-Description=Proxy Node - Tor redirect (WG to localhost)
-After=wg-quick@wg0.service tor.service
-Requires=wg-quick@wg0.service
-# The bridge has to follow the tunnel's whole life, not just its first
-# start. Requires= stops this unit when the tunnel stops, and nothing
-# brought it back when the tunnel came up again - so a tunnel that flapped
-# left the node with its Tor and WARP exits silently gone, and only its
-# direct one working. PartOf= propagates a restart, and being wanted by the
-# tunnel means a tunnel that comes up brings the bridge with it.
-PartOf=wg-quick@wg0.service
-
-[Service]
-Type=simple
-DynamicUser=yes
-ExecStart=/usr/bin/socat TCP-LISTEN:9050,bind=$WG_ASSIGNED_IP,fork,max-children=32 TCP:127.0.0.1:9050
-Restart=always
-RestartSec=5
-NoNewPrivileges=yes
-ProtectSystem=strict
-
-[Install]
-WantedBy=wg-quick@wg0.service
-REDIRECT
-        if [ "$WARP_AVAILABLE" = "1" ]; then
-            cat > /etc/systemd/system/proxy-warp-redirect.service <<REDIRECT
-[Unit]
-Description=Proxy Node - WARP redirect (WG to localhost)
-After=wg-quick@wg0.service warp-svc.service
-Requires=wg-quick@wg0.service
-PartOf=wg-quick@wg0.service
-
-[Service]
-Type=simple
-DynamicUser=yes
-ExecStart=/usr/bin/socat TCP-LISTEN:40000,bind=$WG_ASSIGNED_IP,fork,max-children=32 TCP:127.0.0.1:40000
-Restart=always
-RestartSec=5
-NoNewPrivileges=yes
-ProtectSystem=strict
-
-[Install]
-WantedBy=wg-quick@wg0.service
-REDIRECT
-        fi
-    }
-    systemctl daemon-reload 2>/dev/null || true
-    # Enabled against the tunnel, not against multi-user.target: the bridge
-    # is part of the tunnel, and a tunnel that starts (or restarts) has to
-    # bring it with it.
-    systemctl enable proxy-tor-redirect 2>/dev/null || true
-    systemctl restart proxy-tor-redirect 2>/dev/null || true
-    if [ "$WARP_AVAILABLE" = "1" ]; then
-        systemctl enable proxy-warp-redirect 2>/dev/null || true
-        systemctl restart proxy-warp-redirect 2>/dev/null || true
-    fi
-fi
-
-# --- Set up SOCKS5 proxy systemd service ---
-cat > /etc/systemd/system/proxy-socks5.service <<UNIT
-[Unit]
-Description=Proxy Node - SOCKS5 for direct IP
-After=network-online.target wg-quick@wg0.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=proxysocks
-Group=proxysocks
-ExecStart=/usr/bin/python3 $PROXY_DIR/socks5.py 1080 $WG_ASSIGNED_IP
-Restart=always
-RestartSec=5
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=true
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-systemctl daemon-reload 2>/dev/null || true
-systemctl enable proxy-socks5 2>/dev/null || true
-systemctl restart proxy-socks5 2>/dev/null || true
-
-# --- Watchdog for the tunnel ---
-# A node that is registered but has no tunnel carries nothing, and the hub
-# cannot tell that apart from a node that is not there. So the node watches
-# its own tunnel and puts it back. This is not belt-and-braces: a real node
-# lost its tunnel's address entirely - wg-quick was stopped by something that
-# was not wg-quick - and the interface was left looking fine and carrying
-# nothing, until somebody noticed the exits were down.
-printf '%s' "$WG_ASSIGNED_IP" > "$PROXY_DIR/wg_ip"
-chmod 644 "$PROXY_DIR/wg_ip"
-printf '%s' "$WG_GATEWAY_PUBKEY" > "$PROXY_DIR/wg_hub_public.key"
-chmod 644 "$PROXY_DIR/wg_hub_public.key"
-if [ -f "$(dirname "$(readlink -f "$0")")/proxy-tunnel-watchdog.sh" ]; then
-    install -m 0755 "$(dirname "$(readlink -f "$0")")/proxy-tunnel-watchdog.sh" \
-        /usr/local/bin/proxy-tunnel-watchdog.sh
-    cat > /etc/systemd/system/proxy-tunnel-watchdog.service <<WATCHDOG
-[Unit]
-Description=Proxy Node - keep the WireGuard tunnel alive
-After=wg-quick@wg0.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/proxy-tunnel-watchdog.sh
-WATCHDOG
-    cat > /etc/systemd/system/proxy-tunnel-watchdog.timer <<WATCHDOG
-[Unit]
-Description=Check the Proxy Node's WireGuard tunnel
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
-AccuracySec=10s
-Unit=proxy-tunnel-watchdog.service
-
-[Install]
-WantedBy=timers.target
-WATCHDOG
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl enable --now proxy-tunnel-watchdog.timer 2>/dev/null || true
-else
-    warn "proxy-tunnel-watchdog.sh not found next to this installer; the tunnel will not be watched."
-fi
-
-# --- Verify services ---
-TOR_OK=0; WARP_OK=0; WG_OK=0; SOCKS_OK=0
-systemctl is-active --quiet proxy-tor-redirect && TOR_OK=1
-[ "$WARP_AVAILABLE" = "1" ] && systemctl is-active --quiet proxy-warp-redirect && WARP_OK=1
-systemctl is-active --quiet proxy-socks5 && SOCKS_OK=1
-[ "$WG_CONFIGURED" = "1" ] && wg show wg0 2>/dev/null | grep -q "peer:" && WG_OK=1
-
-# --- Summary ---
-WG_BIND_IP="${WG_ASSIGNED_IP:-no-tunnel}"
-echo ""
-echo "=========================================="
-echo "  Proxy Node: $NODE_NAME"
-echo "=========================================="
-echo ""
-echo "  Public IP:     $PUBLIC_IP"
-echo "  Tor SOCKS5:    $WG_BIND_IP:9050  $([ $TOR_OK = 1 ] && echo '(OK)' || echo '(DOWN)')"
-echo "  WARP SOCKS5:   $WG_BIND_IP:40000 $([ $WARP_OK = 1 ] && echo '(OK)' || echo '(DOWN/not installed)')"
-echo "  Direct SOCKS5: $WG_BIND_IP:1080  $([ $SOCKS_OK = 1 ] && echo '(OK)' || echo '(DOWN)')"
-echo "  WireGuard:     $([ $WG_OK = 1 ] && echo '(OK)' || echo '(not configured)')"
-echo ""
-echo "  Registration: [redacted]"
-echo ""
-echo "  Provides up to 3 egress IPs: Tor exit, WARP exit, node's own IP"
-echo "  Connection: WireGuard VPN (encrypted, authenticated, keypair only)"
-echo ""
-echo "  The hub can open connections to any destination through this node,"
-echo "  including via Tor and WARP. The direct proxy additionally restricts"
-echo "  connections to public hosts on port 443."
-echo ""
-echo "  WireGuard IP: ${WG_ASSIGNED_IP:-not assigned}"
-echo ""
+log "Done."

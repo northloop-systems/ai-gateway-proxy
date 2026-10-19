@@ -1,0 +1,32 @@
+[package]
+name = "ai-gateway-proxy"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Proxy node for the AI Gateway: WireGuard tunnel, three egress exits, one static binary"
+license = "MIT"
+publish = false
+
+# No dependencies.
+#
+# This is the thing that runs as root on somebody else's machine, so it is
+# kept small enough to read in one sitting. The HTTPS call to the hub shells
+# out to the system's curl rather than carrying a TLS stack: curl is already
+# on every machine that would run this, and the token is kept out of the
+# command line by putting it in a private config file rather than in argv.
+[dependencies]
+
+[[bin]]
+name = "ai-gateway-proxy"
+path = "src/main.rs"
+
+[lib]
+name = "ai_gateway_proxy"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
