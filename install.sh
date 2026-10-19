@@ -182,8 +182,88 @@ grep -q "^SocksPort" "$TOR_CONF" && sed -i 's/^SocksPort.*/SocksPort 127.0.0.1:9
 grep -q "^SocksPolicy" "$TOR_CONF" || { echo "SocksPolicy accept 127.0.0.1" >> "$TOR_CONF"; echo "SocksPolicy reject *" >> "$TOR_CONF"; }
 grep -q "^ControlPort" "$TOR_CONF" && sed -i 's/^ControlPort.*/ControlPort 0/' "$TOR_CONF" || echo "ControlPort 0" >> "$TOR_CONF"
 
+# --- Keep the machine's DNS working across the WARP switch ------------------
+# WARP, in tunnel or DNS mode, is usually the machine's resolver: it puts
+# 100.100.100.100 into the machine's DNS configuration. Switching it to proxy
+# mode takes that resolver away with it, and a node whose DNS is dead can
+# neither reach the hub nor resolve anything else - the install dies on its
+# first request, and the machine is left unable to work at all. Work out what
+# the machine was using before the switch, and put it back afterwards if the
+# switch took it away.
+WARP_STATE_DIR=/etc/proxy-node-warp
+# The resolver file, as a variable so the logic can be exercised against a
+# throwaway file instead of the machine's real one.
+RESOLV_CONF="${RESOLV_CONF:-/etc/resolv.conf}"
+mkdir -p "$WARP_STATE_DIR"
+chmod 0700 "$WARP_STATE_DIR"
+
+warp_current_mode() {
+    warp-cli --accept-tos settings 2>/dev/null \
+        | grep -iE "mode:" | head -1 \
+        | sed -E 's/.*mode:[[:space:]]*//' | tr -d '\r' | awk '{print $1}' || true
+}
+
+# The resolvers the machine can actually use: the ones it has now (minus
+# WARP's own and the loopback), then the ones its connection is configured
+# with, then the ones the link carries, and a public resolver last.
+dns_candidates() {
+    local out
+    out=$(grep -E "^nameserver" "$RESOLV_CONF" 2>/dev/null \
+          | grep -vE "^nameserver (100\.100\.100\.100|127\.)" \
+          | awk '{print $2}' | head -3 | tr '\n' ' ' || true)
+    if [ -z "$out" ] && command -v nmcli &>/dev/null; then
+        out=$(nmcli -t -f ipv4.dns con show --active 2>/dev/null \
+              | head -1 | cut -d: -f2- | tr ',' ' ' || true)
+    fi
+    if [ -z "$out" ] && command -v resolvectl &>/dev/null; then
+        out=$(resolvectl dns --no-pager 2>/dev/null \
+              | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+              | grep -vE '^(127\.|100\.100\.100\.100)' | head -3 | tr '\n' ' ' || true)
+    fi
+    [ -z "$out" ] && out="1.1.1.1"
+    echo "$out"
+}
+
+dns_works() {
+    timeout 8 getent hosts one.one.one.one >/dev/null 2>&1
+}
+
+# Write the resolvers back into whatever the machine actually reads. A file
+# owned by systemd-resolved is left alone: 127.0.0.53 always answers, and it
+# asks the link rather than that file.
+restore_dns() {
+    local cands="$1" used=0 dev con
+    if [ ! -L "$RESOLV_CONF" ]; then
+        printf 'nameserver %s\n' $cands > "$RESOLV_CONF" || return 1
+        used=1
+    elif command -v resolvectl &>/dev/null; then
+        dev=$(ip route show default 2>/dev/null | awk '{print $5}' | head -1 || true)
+        if [ -n "$dev" ] && resolvectl dns "$dev" $cands >/dev/null 2>&1; then
+            used=1
+        fi
+    fi
+    # NetworkManager writes the file again on the next reconnect, so its own
+    # idea of the resolvers has to be corrected too.
+    if command -v nmcli &>/dev/null; then
+        con=$(nmcli -t -f NAME con show --active 2>/dev/null | head -1 || true)
+        if [ -n "$con" ]; then
+            dev=$(nmcli -t -f DEVICE con show "$con" 2>/dev/null | cut -d: -f2- || true)
+            nmcli con mod "$con" ipv4.dns "$cands" ipv4.ignore-auto-dns yes \
+                >/dev/null 2>&1 || true
+            if [ -n "$dev" ]; then
+                nmcli device reapply "$dev" >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+    [ "$used" = "1" ]
+}
+
 if [ "$WARP_AVAILABLE" = "1" ]; then
     log "Configuring WARP..."
+    PRE_WARP_MODE=$(warp_current_mode)
+    [ -n "$PRE_WARP_MODE" ] && printf '%s\n' "$PRE_WARP_MODE" > "$WARP_STATE_DIR/mode"
+    DNS_CANDIDATES=$(dns_candidates)
+    printf '%s\n' "$DNS_CANDIDATES" > "$WARP_STATE_DIR/resolvers"
     warp-cli --accept-tos registration new 2>/dev/null || true
     warp-cli --accept-tos mode proxy 2>/dev/null || true
     warp-cli --accept-tos proxy port 40000 2>/dev/null || true
@@ -339,6 +419,21 @@ PYEOF
 chmod 644 "$PROXY_DIR/socks5.py"
 
 # --- Register with server (send WireGuard public key) ---
+# WARP's switch to proxy mode can take the machine's resolver with it, and
+# the machine does not find out until it tries to reach the hub and cannot.
+# Check now, put the resolver back if it is gone, and say so plainly if it
+# cannot be fixed - an unreachable hub and a dead resolver look identical
+# from the outside, and only one of them is the installer's fault.
+if ! dns_works; then
+    if [ -n "${DNS_CANDIDATES:-}" ] && restore_dns "$DNS_CANDIDATES" && dns_works; then
+        log "Restored the resolver WARP was providing"
+    else
+        err "This machine cannot resolve names, so the hub is unreachable."
+        err "  Put a working nameserver in /etc/resolv.conf (e.g. 'nameserver 1.1.1.1')"
+        err "  and run this installer again."
+        exit 1
+    fi
+fi
 PUBLIC_IP=$(curl -s -m 10 https://api.ipify.org 2>/dev/null || echo "unknown")
 log "Registering with server (sending WireGuard public key)..."
 REG_RESPONSE=$(WG_PUB="$WG_PUBLIC_KEY" NODE="$NODE_NAME" PUBIP="$PUBLIC_IP" SU="$SOCKS_USER" SP="$SOCKS_PASS" \

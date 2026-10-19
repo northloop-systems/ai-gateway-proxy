@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -340,6 +341,124 @@ class EndpointDiscoveryTests(unittest.TestCase):
 
     def test_the_env_var_is_still_honoured_as_a_fallback(self):
         self.assertIn('WG_ENDPOINT="${WG_ENDPOINT:-${SERVER_HOST}:51820}"', SRC)
+
+
+class DnsPreservationTests(unittest.TestCase):
+    """Switching WARP to proxy mode must not take the machine's DNS with it.
+
+    Found on a real node: the installer flipped WARP to proxy mode, WARP's
+    resolver (100.100.100.100) went away with it, and the machine could no
+    longer resolve anything. The preflight had already run - that is why it
+    reported "Server OK" - and the registration, which came after the switch,
+    could not reach the hub. The install died with a bare "could not reach the
+    server", which reads like a network problem and is really a resolver
+    problem, and the user's machine was left unable to work.
+    """
+
+    FUNCTIONS = ("warp_current_mode", "dns_candidates", "dns_works", "restore_dns")
+
+    def _helpers(self) -> str:
+        """The DNS helpers, extracted so they can be run for real."""
+        parts = []
+        for name in self.FUNCTIONS:
+            match = re.search(rf"^{name}\(\) \{{\n.*?^\}}", SRC, re.S | re.M)
+            self.assertIsNotNone(match, f"{name} not found in install.sh")
+            parts.append(match.group(0))
+        return "\n\n".join(parts)
+
+    def _run(self, script: str, env: dict) -> str:
+        """Run the helpers with the network tools stubbed out, so the result
+        depends on the resolver file and nothing else."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "bin"
+            stub.mkdir()
+            for tool in ("nmcli", "resolvectl"):
+                (stub / tool).write_text("#!/bin/sh\nexit 1\n")
+                (stub / tool).chmod(0o755)
+            full = f"set -euo pipefail\n{self._helpers()}\n{script}"
+            out = subprocess.run(
+                ["bash", "-c", full],
+                capture_output=True, text=True, env={"PATH": f"{stub}:/usr/bin:/bin", **env},
+            )
+            self.assertEqual(out.returncode, 0, (out.stdout + out.stderr)[:2000])
+            return out.stdout.strip()
+
+    def test_resolvers_are_captured_before_warp_is_switched(self):
+        """The whole point: what the machine was using has to be known BEFORE
+        the switch removes it."""
+        capture = SRC.index("DNS_CANDIDATES=$(dns_candidates)")
+        switch = SRC.index("warp-cli --accept-tos mode proxy")
+        self.assertLess(capture, switch,
+                        "the resolvers are read after WARP already took them away")
+
+    def test_the_dns_is_checked_before_the_registration(self):
+        """The registration is the first request the node makes after the
+        switch, so that is where the resolver has to be working."""
+        check = SRC.index("if ! dns_works; then")
+        register = SRC.index("$SERVER_URL/proxy/register")
+        self.assertLess(check, register, "DNS is checked after the registration")
+
+    def test_a_dead_resolver_is_reported_as_such(self):
+        """A bare 'cannot reach the server' sends people looking at their
+        network. Say what is actually wrong and how to fix it."""
+        block = SRC[SRC.index("if ! dns_works; then"):]
+        block = block[:block.index("fi", block.index("err \"This machine cannot resolve"))]
+        self.assertIn("cannot resolve", block)
+        self.assertIn("resolv.conf", block)
+        self.assertIn("exit 1", block)
+
+    def test_the_candidates_exclude_warps_own_resolver(self):
+        """100.100.100.100 is the resolver the switch removes. Saving it back
+        would restore the breakage."""
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "resolv.conf"
+            conf.write_text("nameserver 100.100.100.100\nnameserver 192.168.1.1\n")
+            out = self._run("dns_candidates", {"RESOLV_CONF": str(conf)})
+        self.assertEqual(out, "192.168.1.1")
+
+    def test_a_public_resolver_is_the_last_resort(self):
+        """A machine whose only nameserver was WARP's has nothing left to
+        fall back on, and a node with no DNS is a node that cannot register."""
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "resolv.conf"
+            conf.write_text("nameserver 100.100.100.100\n")
+            out = self._run("dns_candidates", {"RESOLV_CONF": str(conf)})
+        self.assertEqual(out, "1.1.1.1")
+
+    def test_the_resolver_file_is_restored_when_it_is_a_plain_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conf = Path(tmp) / "resolv.conf"
+            conf.write_text("nameserver 100.100.100.100\n")
+            self._run('restore_dns "1.1.1.1 9.9.9.9"', {"RESOLV_CONF": str(conf)})
+            self.assertEqual(
+                conf.read_text().split(),
+                ["nameserver", "1.1.1.1", "nameserver", "9.9.9.9"],
+            )
+
+    def test_a_resolved_stub_is_not_overwritten(self):
+        """systemd-resolved's stub always answers, and it asks the LINK, not
+        that file. Writing the resolvers into it breaks resolved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "stub-resolv.conf"
+            stub.write_text("nameserver 127.0.0.53\n")
+            link = Path(tmp) / "resolv.conf"
+            link.symlink_to(stub)
+            self._run('restore_dns "1.1.1.1" || true', {"RESOLV_CONF": str(link)})
+            self.assertTrue(link.is_symlink(), "the stub was replaced by a regular file")
+            self.assertEqual(stub.read_text(), "nameserver 127.0.0.53\n")
+
+    def test_the_previous_warp_mode_is_kept_for_the_uninstaller(self):
+        """The mode belongs to the machine, not to the node, so the
+        uninstaller has to be able to give it back."""
+        self.assertIn("warp_current_mode", SRC)
+        self.assertIn("WARP_STATE_DIR/mode", SRC)
+        self.assertIn("WARP_STATE_DIR/mode", UNINSTALL_SRC)
+
+    def test_the_uninstaller_gives_the_mode_and_resolver_back(self):
+        for expected in ("mode proxy", "mode dns", "mode warp"):
+            self.assertIn(expected, UNINSTALL_SRC)
+        self.assertIn("WARP_STATE_DIR/resolvers", UNINSTALL_SRC)
 
 
 class UninstallerTests(unittest.TestCase):

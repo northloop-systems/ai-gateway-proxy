@@ -9,10 +9,13 @@
 #   - stops and removes the services, the keypair, the proxy account
 #   - restores /etc/tor/torrc from the pristine backup the installer kept
 #
-# It does NOT undo the WARP registration or WARP's own configuration: WARP may
-# have been on the machine before this, and the installer cannot know whether
-# it was the user's WARP or its own. `warp-cli registration delete` removes
-# the registration if you want that too.
+# It DOES undo what the installer changed about WARP's mode and the machine's
+# resolver, because those belong to the machine rather than to the node.
+#
+# It does NOT remove the WARP registration itself: WARP may have been on the
+# machine before this, and the installer cannot know whether it was the
+# user's WARP or its own. `warp-cli registration delete` removes the
+# registration if you want that too.
 #
 # Usage:
 #   sudo bash uninstall.sh
@@ -127,5 +130,38 @@ else
     warn "No /etc/tor/torrc.bak found; torrc left as it is"
 fi
 
+# --- 6. Give WARP and the resolver back -------------------------------------
+# The installer flipped WARP into proxy mode and may have had to put the
+# machine's resolver back by hand. Both belong to the machine, not to the
+# node, so the uninstaller returns them.
+WARP_STATE_DIR=/etc/proxy-node-warp
+if [ -f "$WARP_STATE_DIR/mode" ] && command -v warp-cli &>/dev/null; then
+    PRE_MODE=$(head -1 "$WARP_STATE_DIR/mode")
+    case "$(printf '%s' "$PRE_MODE" | tr 'A-Z' 'a-z')" in
+        *proxy*)
+            warp-cli --accept-tos mode proxy >/dev/null 2>&1 || true
+            PORT=$(printf '%s' "$PRE_MODE" | grep -oE '[0-9]+$' | head -1)
+            [ -n "$PORT" ] && warp-cli --accept-tos proxy port "$PORT" >/dev/null 2>&1 || true
+            log "WARP returned to proxy mode (port ${PORT:-40000})"
+            ;;
+        *dns*)
+            warp-cli --accept-tos mode dns >/dev/null 2>&1 || true
+            log "WARP returned to DNS mode"
+            ;;
+        *)
+            warp-cli --accept-tos mode warp >/dev/null 2>&1 || true
+            log "WARP returned to tunnel mode"
+            ;;
+    esac
+fi
+if [ -f "$WARP_STATE_DIR/resolvers" ]; then
+    RESOLVERS=$(cat "$WARP_STATE_DIR/resolvers")
+    if [ -n "$RESOLVERS" ] && [ ! -L /etc/resolv.conf ]; then
+        printf 'nameserver %s\n' $RESOLVERS > /etc/resolv.conf
+        log "System resolver restored"
+    fi
+fi
+rm -rf "$WARP_STATE_DIR"
+
 log "Uninstall complete."
-log "WARP was not touched: warp-cli registration delete removes it if you want that."
+log "WARP's registration is still on the machine: warp-cli registration delete removes it."
