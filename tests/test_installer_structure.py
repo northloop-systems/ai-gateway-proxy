@@ -94,12 +94,22 @@ class WireGuardConfigTests(unittest.TestCase):
         body = self._wg_heredoc()
         self.assertIn("AllowedIPs = 10.200.0.1/32", body)
 
-    def test_endpoint_is_not_taken_from_the_server(self):
-        # The server must not control where the tunnel points; it used to be
-        # parsed out of the registration response, which also hung waiting on
-        # stdin when the pipe was lost.
-        self.assertIn('WG_GATEWAY_ENDPOINT="$WG_ENDPOINT"', SRC)
-        self.assertNotIn("wireguard_endpoint',", SRC)
+    def test_the_endpoint_comes_from_the_hub(self):
+        # The hub is the authority on where it can be reached, and it may be
+        # reachable somewhere the operator never had to think about - a public
+        # IPv6, a tunnel, a different hostname entirely. Making the operator
+        # supply it turned a two-line install into one that needs the hub's
+        # network topology spelled out.
+        #
+        # A hub that answered with a bogus endpoint cannot use it to redirect
+        # the node's traffic: the tunnel's peer is authenticated by the hub's
+        # WireGuard PUBLIC KEY, which the node verifies from the same
+        # response, so a handshake to any other host simply fails.
+        #
+        # The earlier implementation that also read the endpoint out of the
+        # response hung waiting on stdin when the pipe was lost; this one
+        # parses the same way as the two extractions beside it, so it cannot.
+        self.assertIn('WG_GATEWAY_ENDPOINT="${WG_ADVERTISED_ENDPOINT:-$WG_ENDPOINT}"', SRC)
 
 
 class ValidationTests(unittest.TestCase):
@@ -325,7 +335,7 @@ class EndpointDiscoveryTests(unittest.TestCase):
         inject a directive into the WireGuard config."""
         self.assertRegex(
             SRC,
-            r'WG_GATEWAY_ENDPOINT"=~ \^\[a-zA-Z0-9\._-\]\+:\[0-9\]\{1,5\}\$',
+            r'WG_GATEWAY_ENDPOINT"\s*=~\s*\^\[a-zA-Z0-9\._-\]\+:\[0-9\]\{1,5\}\$',
         )
 
     def test_the_env_var_is_still_honoured_as_a_fallback(self):
