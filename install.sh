@@ -84,6 +84,19 @@ if [ "$HTTP_CODE" != "200" ]; then
 fi
 log "Server OK"
 
+# A per-node token is bound to ONE node name, and the hub refuses a
+# registration under any other. The node's own hostname is almost never that
+# name, so guessing it is a dead end - but the hub already knows which node
+# the token belongs to, and says so. Take the name from there, so pasting a
+# token is all anyone has to do.
+BOUND_NODE=$(curl -s -m 15 --config "$CURL_AUTH" \
+    "$SERVER_URL/proxy/whoami" 2>/dev/null \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('bound_node') or '')" 2>/dev/null || echo "")
+if [ -n "$BOUND_NODE" ] && [ "$NODE_NAME" = "$(hostname)" ]; then
+    NODE_NAME="$BOUND_NODE"
+    log "This token is bound to node '$NODE_NAME'"
+fi
+
 # --- Detect OS ---
 detect_os() {
     if [ -f /etc/os-release ]; then
