@@ -564,6 +564,13 @@ WGEOF
 Description=Proxy Node - Tor redirect (WG to localhost)
 After=wg-quick@wg0.service tor.service
 Requires=wg-quick@wg0.service
+# The bridge has to follow the tunnel's whole life, not just its first
+# start. Requires= stops this unit when the tunnel stops, and nothing
+# brought it back when the tunnel came up again - so a tunnel that flapped
+# left the node with its Tor and WARP exits silently gone, and only its
+# direct one working. PartOf= propagates a restart, and being wanted by the
+# tunnel means a tunnel that comes up brings the bridge with it.
+PartOf=wg-quick@wg0.service
 
 [Service]
 Type=simple
@@ -575,7 +582,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=wg-quick@wg0.service
 REDIRECT
         if [ "$WARP_AVAILABLE" = "1" ]; then
             cat > /etc/systemd/system/proxy-warp-redirect.service <<REDIRECT
@@ -583,6 +590,7 @@ REDIRECT
 Description=Proxy Node - WARP redirect (WG to localhost)
 After=wg-quick@wg0.service warp-svc.service
 Requires=wg-quick@wg0.service
+PartOf=wg-quick@wg0.service
 
 [Service]
 Type=simple
@@ -594,11 +602,14 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=wg-quick@wg0.service
 REDIRECT
         fi
     }
     systemctl daemon-reload 2>/dev/null || true
+    # Enabled against the tunnel, not against multi-user.target: the bridge
+    # is part of the tunnel, and a tunnel that starts (or restarts) has to
+    # bring it with it.
     systemctl enable proxy-tor-redirect 2>/dev/null || true
     systemctl restart proxy-tor-redirect 2>/dev/null || true
     if [ "$WARP_AVAILABLE" = "1" ]; then

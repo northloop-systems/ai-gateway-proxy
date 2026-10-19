@@ -486,6 +486,53 @@ class TokenPromptTests(unittest.TestCase):
         self.assertIn('if [ -z "$API_TOKEN" ]; then', SRC)
 
 
+class TunnelLifecycleTests(unittest.TestCase):
+    """A node's exits have to follow the tunnel's whole life.
+
+    Found on a real node: the tunnel was stopped and started again (a
+    reboot, a network change, a sleep), and the Tor and WARP bridges stayed
+    down. `Requires=wg-quick@wg0` stops them when the tunnel stops, and
+    nothing brought them back - so the node was left with one working exit
+    out of three and no explanation anywhere.
+    """
+
+    def _unit(self, name: str) -> str:
+        marker = f"/etc/systemd/system/{name}.service"
+        start = SRC.index(marker)
+        end = SRC.index("\nREDIRECT" if "REDIRECT" in SRC[start:start + 2000] else "\nUNIT",
+                        start)
+        return SRC[start:end]
+
+    def test_the_bridges_follow_the_tunnel(self):
+        for unit in ("proxy-tor-redirect", "proxy-warp-redirect"):
+            with self.subTest(unit=unit):
+                body = self._unit(unit)
+                self.assertIn("PartOf=wg-quick@wg0.service", body,
+                              f"{unit} does not follow the tunnel's restarts")
+
+    def test_the_bridges_are_started_by_the_tunnel(self):
+        """Wanted by the tunnel, not by multi-user.target: a tunnel that
+        comes up has to bring the bridge with it."""
+        for unit in ("proxy-tor-redirect", "proxy-warp-redirect"):
+            with self.subTest(unit=unit):
+                body = self._unit(unit)
+                self.assertIn("WantedBy=wg-quick@wg0.service", body,
+                              f"{unit} is not started by the tunnel")
+                self.assertNotIn("WantedBy=multi-user.target", body)
+
+    def test_the_bridges_still_require_the_tunnel(self):
+        for unit in ("proxy-tor-redirect", "proxy-warp-redirect"):
+            with self.subTest(unit=unit):
+                self.assertIn("Requires=wg-quick@wg0.service", self._unit(unit))
+
+    def test_the_direct_proxy_retries_until_the_address_is_back(self):
+        """It binds the tunnel's own address, so it cannot start before the
+        tunnel does - and it has to keep trying until it can."""
+        body = self._unit("proxy-socks5")
+        self.assertIn("Restart=always", body)
+        self.assertIn("RestartSec=", body)
+
+
 class UninstallerTests(unittest.TestCase):
     """uninstall.sh has to leave the machine as it found it.
 
