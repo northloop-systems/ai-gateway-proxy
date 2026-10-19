@@ -70,9 +70,14 @@ chmod 600 "$CURL_AUTH"
 trap 'rm -f "${CURL_AUTH:-}"' EXIT
 printf 'header = "Authorization: Bearer %s"\n' "$API_TOKEN" > "$CURL_AUTH"
 log "Verifying connectivity..."
+# Preflight against a /v1/proxy path, NOT /v1/models. A per-node token is scoped
+# to /v1/proxy and is refused with 403 everywhere else, so probing it against a
+# normal gateway endpoint fails for every correct token - the installer rejects
+# a credential it was just handed. /v1/proxy/whoami is in scope and answers
+# only about the caller.
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 15 \
     --config "$CURL_AUTH" \
-    "$SERVER_URL/models" 2>/dev/null || echo "000")
+    "$SERVER_URL/proxy/whoami" 2>/dev/null || echo "000")
 if [ "$HTTP_CODE" != "200" ]; then
     err "Cannot reach server (HTTP $HTTP_CODE). Check API_TOKEN and network."
     exit 1

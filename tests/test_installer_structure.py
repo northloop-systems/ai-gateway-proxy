@@ -275,5 +275,32 @@ class EndpointTests(unittest.TestCase):
         self.assertIn('WG_ENDPOINT:-${SERVER_HOST}:51820', SRC)
 
 
+class PreflightTests(unittest.TestCase):
+    """The installer proves its credential works before it registers.
+
+    That check has to be reachable by the credential the installer was given.
+    A per-node token is scoped to /v1/proxy and is refused with 403 on
+    everything else, so probing it against a normal gateway endpoint - which
+    is what the preflight used to do - fails for EVERY correct token. The
+    installer then rejected the credential it had just been handed and exited,
+    so no node could install at all.
+
+    Found by running the real installer against a real hub with a real
+    per-node token: "Cannot reach server (HTTP 403). Check API_TOKEN and
+    network." - with a token the hub would have accepted a moment later.
+    """
+
+    def test_preflight_targets_a_proxy_scoped_path(self):
+        self.assertIn('"$SERVER_URL/proxy/whoami"', SRC)
+
+    def test_preflight_never_probes_a_non_proxy_endpoint(self):
+        for bad in ('"$SERVER_URL/models"',
+                    '"$SERVER_URL/chat/completions"',
+                    '"$SERVER_URL/embeddings"'):
+            self.assertNotIn(bad, SRC,
+                             f"preflight must not use {bad}: a per-node token is "
+                             f"refused outside /v1/proxy")
+
+
 if __name__ == "__main__":
     unittest.main()
