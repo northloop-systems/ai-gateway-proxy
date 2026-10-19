@@ -364,6 +364,18 @@ else
     log "Assigned WireGuard IP: $WG_ASSIGNED_IP"
     log "Gateway WireGuard public key received"
 
+    # --- Persist the credential and node id for the uninstaller ---
+    # The token is kept 0600, in the same directory that already holds the
+    # SOCKS password inside socks5.py, so this adds no new secret to the node.
+    # The uninstaller needs it to tell the hub the node is leaving: a per-node
+    # token may revoke its OWN node, so a node can deregister itself without
+    # the operator having to intervene.
+    install -d -m 0750 -o root -g proxysocks "$PROXY_DIR"
+    printf '%s' "$API_TOKEN" > "$PROXY_DIR/token"
+    chmod 600 "$PROXY_DIR/token"
+    printf '%s' "$NODE_NAME" > "$PROXY_DIR/node_name"
+    chmod 600 "$PROXY_DIR/node_name"
+
     # --- Configure WireGuard ---
     log "Configuring WireGuard..."
     cat > /etc/wireguard/wg0.conf <<WGEOF

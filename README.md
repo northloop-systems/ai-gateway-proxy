@@ -83,15 +83,18 @@ numbers.
 ## Uninstall
 
 ```bash
-systemctl disable --now proxy-socks5 proxy-tor-redirect proxy-warp-redirect wg-quick@wg0 2>/dev/null
-rm -f /etc/systemd/system/proxy-*.service /etc/wireguard/wg0.conf
-systemctl daemon-reload
-rm -rf /opt/proxy-node; userdel proxysocks
+curl -fsSL https://raw.githubusercontent.com/northloop-systems/ai-gateway-proxy/main/uninstall.sh | sudo bash
 ```
 
-This removes the tunnel, the services and the firewall rules it added. It does
-not undo the edits to `/etc/tor/torrc` or the WARP registration — restore
-`/etc/tor/torrc.bak` by hand if you want your original back.
+That tells the hub the node is leaving — so it drops the node and tears down
+the WireGuard peer instead of keeping a route pointed at an address that no
+longer answers — then removes the tunnel, the firewall rules it added, the
+services, the keypair, the proxy account, and restores `/etc/tor/torrc` from
+the pristine backup the installer kept.
+
+It does **not** undo the WARP registration: WARP may have been on your
+machine already, and the installer cannot tell whose it was. If you want that
+gone too, `warp-cli registration delete` removes it.
 
 ## Requirements
 

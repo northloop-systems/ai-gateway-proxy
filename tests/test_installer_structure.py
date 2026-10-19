@@ -22,7 +22,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 INSTALLER = REPO / "install.sh"
+UNINSTALLER = REPO / "uninstall.sh"
 SRC = INSTALLER.read_text()
+UNINSTALL_SRC = UNINSTALLER.read_text()
 
 
 class ShellTests(unittest.TestCase):
@@ -300,6 +302,76 @@ class PreflightTests(unittest.TestCase):
             self.assertNotIn(bad, SRC,
                              f"preflight must not use {bad}: a per-node token is "
                              f"refused outside /v1/proxy")
+
+
+class UninstallerTests(unittest.TestCase):
+    """uninstall.sh has to leave the machine as it found it.
+
+    The firewall rules are wg-quick's PostUp/PostDown rules, so they only go
+    away if the interface is brought down while its config is still in place.
+    Getting that wrong is invisible from the unit tests and obvious on a
+    friend's laptop: a stale DROP rule on an interface that no longer exists.
+    """
+
+    def test_parses(self):
+        subprocess.run(["bash", "-n", str(UNINSTALLER)], check=True)
+
+    @unittest.skipUnless(shutil.which("shellcheck"), "shellcheck not installed")
+    def test_shellcheck_clean_at_warning_level(self):
+        out = subprocess.run(
+            ["shellcheck", "-S", "warning", str(UNINSTALLER)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(out.returncode, 0, (out.stdout + out.stderr)[:2000])
+
+    def test_requires_root(self):
+        self.assertIn("id -u", UNINSTALL_SRC)
+
+    def test_brings_the_tunnel_down_before_removing_its_config(self):
+        # The rules are PostDown rules: the interface must be stopped while
+        # /etc/wireguard/wg0.conf still exists, or they are never removed.
+        down = UNINSTALL_SRC.index("wg-quick@wg0")
+        rm = UNINSTALL_SRC.index("rm -f /etc/wireguard/wg0.conf")
+        self.assertLess(down, rm,
+                        "the tunnel must be brought down before its config is removed")
+
+    def test_removes_the_firewall_rules_explicitly(self):
+        """PostDown normally removes them, but a hand-deleted interface or a
+        failed shutdown leaves them behind, so they are also removed directly."""
+        for port in ("1080", "9050", "40000"):
+            self.assertIn(f"--dport {port}", UNINSTALL_SRC)
+        self.assertIn("iptables -D INPUT -i wg0 -j DROP", UNINSTALL_SRC)
+
+    def test_never_guards_the_stop_behind_a_pipeline(self):
+        """`systemctl ... | grep -q` under `set -o pipefail` is a trap: grep -q
+        exits at the first match, systemctl takes a SIGPIPE, the pipeline reports
+        failure, and the tunnel is never stopped - so its PostDown never runs
+        and the firewall rules are left behind. The uninstaller must not build
+        that decision out of a pipeline."""
+        for line in UNINSTALL_SRC.splitlines():
+            if "wg-quick@wg0" not in line:
+                continue
+            # "||" is a fallback, not a pipe; only a real pipe is the trap.
+            if "|" in line.replace("||", ""):
+                self.fail(f"the tunnel stop must not be guarded by a pipeline: {line.strip()}")
+
+    def test_deregisters_from_the_hub_with_the_nodes_own_token(self):
+        """A per-node token may revoke its OWN node, so a node can leave
+        without the operator having to intervene."""
+        self.assertIn("/proxy/nodes/node-", UNINSTALL_SRC)
+        self.assertIn("Authorization: Bearer", UNINSTALL_SRC)
+
+    def test_restores_torrc_from_the_pristine_backup(self):
+        self.assertIn("/etc/tor/torrc.bak", UNINSTALL_SRC)
+
+    def test_does_not_touch_the_warp_registration(self):
+        """WARP may have been on the machine before the installer ran, so the
+        uninstaller must not silently delete the user's registration. It may
+        MENTION the command, but must never run it."""
+        for line in UNINSTALL_SRC.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("warp-cli") and "registration delete" in stripped:
+                self.fail(f"the uninstaller must not run: {stripped}")
 
 
 if __name__ == "__main__":
