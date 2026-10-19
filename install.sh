@@ -101,7 +101,7 @@ detect_os() {
 OS=$(detect_os)
 log "OS: $OS"
 
-# --- Install packages (WireGuard, no SSH, no chisel) ---
+# --- Install packages (WireGuard) ---
 install_packages() {
     case "$OS" in
         ubuntu|debian)
@@ -123,7 +123,7 @@ install_packages() {
             ;;
     esac
 }
-log "Installing packages (WireGuard, no SSH, no chisel)..."
+log "Installing packages (WireGuard)..."
 install_packages
 
 if ! command -v iptables &>/dev/null; then
@@ -333,6 +333,24 @@ REG_RESPONSE=$(WG_PUB="$WG_PUBLIC_KEY" NODE="$NODE_NAME" PUBIP="$PUBLIC_IP" SU="
     | curl -s -m 15 -X POST --config "$CURL_AUTH" \
     -H "Content-Type: application/json" -d @- \
     "$SERVER_URL/proxy/register" 2>/dev/null || echo '{"status":"error"}')
+
+# A request that never reached the hub, or that the hub refused, must not be
+# reported as a bad public key: those need completely different fixes, and
+# "the server said your key is invalid" sends people looking at their own
+# key instead of at the request. Say which it was, and show the answer.
+if ! echo "$REG_RESPONSE" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
+    err "Could not reach the hub at ${SERVER_URL}/proxy/register."
+    err "  response: ${REG_RESPONSE:0:300}"
+    exit 1
+fi
+REG_STATUS=$(echo "$REG_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || echo "")
+if [ "$REG_STATUS" != "ok" ]; then
+    err "The hub refused the registration."
+    err "  response: ${REG_RESPONSE:0:300}"
+    err "  The token is bound to one node name; register under that name, or ask"
+    err "  the operator for a token for '$NODE_NAME'."
+    exit 1
+fi
 
 # Extract assigned WireGuard IP and gateway's public key from response
 WG_ASSIGNED_IP=$(echo "$REG_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('wireguard_ip',''))" 2>/dev/null || echo "")
