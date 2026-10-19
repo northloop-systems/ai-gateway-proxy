@@ -337,7 +337,13 @@ REG_RESPONSE=$(WG_PUB="$WG_PUBLIC_KEY" NODE="$NODE_NAME" PUBIP="$PUBLIC_IP" SU="
 # Extract assigned WireGuard IP and gateway's public key from response
 WG_ASSIGNED_IP=$(echo "$REG_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('wireguard_ip',''))" 2>/dev/null || echo "")
 WG_GATEWAY_PUBKEY=$(echo "$REG_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('wireguard_gateway_public_key',''))" 2>/dev/null || echo "")
-WG_GATEWAY_ENDPOINT="$WG_ENDPOINT"
+# The hub is the authority on where to reach it, so use the endpoint it
+# advertised. The env var is only the fallback for a hub that did not say.
+# This is what lets the whole install be `curl ... | bash`: the node learns
+# the hub's address from the hub, instead of the operator having to know it
+# and pass it in.
+WG_ADVERTISED_ENDPOINT=$(echo "$REG_RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('wireguard_endpoint',''))" 2>/dev/null || echo "")
+WG_GATEWAY_ENDPOINT="${WG_ADVERTISED_ENDPOINT:-$WG_ENDPOINT}"
 
 # --- Validate server-supplied values (prevent config injection) ---
 # Use bash regex (not grep) to match the ENTIRE string, preventing

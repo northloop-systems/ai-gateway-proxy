@@ -304,6 +304,34 @@ class PreflightTests(unittest.TestCase):
                              f"refused outside /v1/proxy")
 
 
+class EndpointDiscoveryTests(unittest.TestCase):
+    """The hub tells the node where to reach it; the node listens.
+
+    The whole install has to work as `curl ... | bash`, which means the node
+    cannot need the operator to know the hub's address and pass it in as an
+    environment variable. The registration response already carries the
+    endpoint, so the node uses that, and the env var is only the fallback.
+    """
+
+    def test_the_advertised_endpoint_is_read_from_the_registration_response(self):
+        self.assertIn("wireguard_endpoint", SRC)
+        self.assertIn("WG_ADVERTISED_ENDPOINT", SRC)
+
+    def test_the_advertised_endpoint_wins_over_the_environment(self):
+        self.assertIn('WG_GATEWAY_ENDPOINT="${WG_ADVERTISED_ENDPOINT:-$WG_ENDPOINT}"', SRC)
+
+    def test_the_advertised_endpoint_is_still_validated(self):
+        """A hub that answered with something malformed must not be able to
+        inject a directive into the WireGuard config."""
+        self.assertRegex(
+            SRC,
+            r'WG_GATEWAY_ENDPOINT"=~ \^\[a-zA-Z0-9\._-\]\+:\[0-9\]\{1,5\}\$',
+        )
+
+    def test_the_env_var_is_still_honoured_as_a_fallback(self):
+        self.assertIn('WG_ENDPOINT="${WG_ENDPOINT:-${SERVER_HOST}:51820}"', SRC)
+
+
 class UninstallerTests(unittest.TestCase):
     """uninstall.sh has to leave the machine as it found it.
 
