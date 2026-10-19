@@ -29,6 +29,13 @@ knowing up front:
   `/etc/tor/torrc` (keeping a copy at `/etc/tor/torrc.bak`), and on
   Debian/Ubuntu it registers Cloudflare WARP and switches it to proxy mode —
   which will replace an existing WARP registration.
+- **Your DNS settings may be touched, and are put back.** WARP in tunnel or
+  DNS mode is usually your machine's resolver, and switching it to proxy mode
+  takes that resolver away with it — which leaves a machine that cannot
+  resolve anything, including the hub. The installer remembers what you were
+  using before the switch and puts it back afterwards, and says so when it
+  does. If it cannot, it says that plainly and stops, rather than failing
+  later with a confusing "cannot reach the server".
 - **Don't use it on a work or school machine.** The traffic is attributable to
   you.
 
@@ -92,7 +99,10 @@ longer answers — then removes the tunnel, the firewall rules it added, the
 services, the keypair, the proxy account, and restores `/etc/tor/torrc` from
 the pristine backup the installer kept.
 
-It does **not** undo the WARP registration: WARP may have been on your
+It also gives back what the installer changed about your own machine: WARP
+goes back to the mode it was in before, and so does your resolver.
+
+It does **not** remove the WARP registration: WARP may have been on your
 machine already, and the installer cannot tell whose it was. If you want that
 gone too, `warp-cli registration delete` removes it.
 
