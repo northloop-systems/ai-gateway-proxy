@@ -59,10 +59,18 @@ pub fn run(options: &InstallOptions) -> Result<(), String> {
     // it in, and is asked for when the binary is run on its own. It is
     // asked for VISIBLY: a masked prompt cannot be checked, and the
     // commonest failure is a token pasted with a character missing.
+    //
+    // A token this machine was already registered with is used as it is:
+    // the installer saves it, and a node that has to be re-installed (a
+    // changed hub key, a moved machine) should not have to be handed a
+    // secret it already holds. Passing --token still replaces it.
     let token = if !options.token.is_empty() {
         options.token.clone()
     } else if let Ok(from_env) = std::env::var("AI_GATEWAY_PROXY_TOKEN") {
         from_env.trim().to_string()
+    } else if let Some(saved) = saved_token() {
+        log::step("Using the token this machine was registered with.");
+        saved
     } else {
         prompt_for_token()?
     };
@@ -329,6 +337,27 @@ fn generate_socks_password() -> String {
 
 /// Ask for the token on the terminal, showing it as it is typed.
 ///
+/// The token this machine was registered with, if it still has one.
+///
+/// It is read from the state directory, which is root-only, and it is
+/// only ever used when the operator gave no token of their own: a node
+/// that is being re-registered (a changed hub key, a moved machine) should
+/// not have to be handed a secret it already holds.
+fn saved_token() -> Option<String> {
+    saved_token_in(STATE_DIR)
+}
+
+fn saved_token_in(dir: &str) -> Option<String> {
+    let path = std::path::Path::new(dir).join("token");
+    let text = fs_util::read_to_string(&path)?;
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 /// The installer script does this itself, so that the token is read in
 /// the same place the operator is looking. This is here for the case
 /// where the binary is run on its own.
@@ -370,4 +399,42 @@ fn effective_uid() -> u32 {
     crate::run::capture("id", &["-u"])
         .and_then(|text| text.trim().parse::<u32>().ok())
         .unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-gateway-proxy-install-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn a_saved_token_is_found() {
+        // The installer saves the token, so a node that is being
+        // re-registered does not have to be handed a secret it already
+        // holds.
+        let dir = temp_dir("saved");
+        std::fs::write(dir.join("token"), "pk-example-token\n").unwrap();
+        assert_eq!(
+            saved_token_in(dir.to_str().unwrap()).as_deref(),
+            Some("pk-example-token")
+        );
+    }
+
+    #[test]
+    fn an_empty_saved_token_is_no_token() {
+        let dir = temp_dir("empty");
+        std::fs::write(dir.join("token"), "  \n").unwrap();
+        assert_eq!(saved_token_in(dir.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn no_saved_token_is_no_token() {
+        let dir = temp_dir("none");
+        assert_eq!(saved_token_in(dir.to_str().unwrap()), None);
+    }
 }

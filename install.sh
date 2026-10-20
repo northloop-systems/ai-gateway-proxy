@@ -125,6 +125,17 @@ log "Installed $INSTALL_PATH"
 # The token is prompted for here rather than in the binary, so it is shown
 # as it is typed: a masked prompt cannot be checked, and the commonest
 # failure is a token pasted with a character missing.
+#
+# A machine that is already registered keeps its token, and this script
+# does not ask for it again: re-installing a node (a changed hub key, a
+# moved machine) should not have to be handed a secret it already holds.
+# Pass --token to replace it.
+SAVED_TOKEN_FILE="/opt/proxy-node/token"
+if [ -z "${AI_GATEWAY_PROXY_TOKEN:-}" ] && [ -r "$SAVED_TOKEN_FILE" ] && [ -s "$SAVED_TOKEN_FILE" ]; then
+    log "Using the token this machine was registered with."
+    log "  (pass --token to use a different one)"
+    AI_GATEWAY_PROXY_TOKEN="$(cat "$SAVED_TOKEN_FILE")"
+fi
 if [ -z "${AI_GATEWAY_PROXY_TOKEN:-}" ]; then
     echo ""
     echo "  =========================================="
