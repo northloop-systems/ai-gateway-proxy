@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Test the SOCKS5 proxy that install.sh actually ships.
+"""Test the SOCKS5 proxy the node actually runs.
 
-The proxy is generated as a heredoc inside install.sh, so testing a copy of it
-would test nothing. These tests extract the real block from the installer,
-substitute the generated credentials, and drive it over a loopback socket: real
-SOCKS5 handshakes against the real handler, with a stub upstream standing in for
-the destination.
+The proxy is the `ai-gateway-proxy` binary - the same one the installer
+puts on the machine - so these tests drive that binary over a loopback
+socket: real SOCKS5 handshakes against the real server, with the real
+destination filter.
 
 What is actually being pinned:
   - the destination restriction (port 443, globally-routable addresses only)
@@ -38,35 +37,31 @@ USER = "testuser"
 PASSWORD = "testpassword"
 
 
-def extract_socks5() -> str:
-    """Pull the socks5.py heredoc out of install.sh verbatim."""
-    src = INSTALLER.read_text()
-    start = src.index('cat > "$PROXY_DIR/socks5.py"')
-    block = src[start:]
-    heredoc = block.index("<<PYEOF\n") + len("<<PYEOF\n")
-    return block[heredoc:block.index("\nPYEOF", heredoc)]
+def build_binary() -> Path:
+    """Build the node binary, once, and remember where it is."""
+    cargo = os.environ.get("CARGO", "cargo")
+    target = REPO / "target" / "debug" / "ai-gateway-proxy"
+    if not target.exists():
+        subprocess.run([cargo, "build"], cwd=REPO, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return target
 
 
-def build_proxy(port: int, bind_host: str) -> Path:
-    """Materialise the shipped proxy, pointed somewhere a test can reach.
+def start_proxy(port: int, bind_host: str) -> tuple[Path, subprocess.Popen]:
+    """Run the node's proxy, pointed somewhere a test can reach.
 
-    Two substitutions, both of the "configuration the installer generates at
-    install time" kind rather than logic changes:
-      - SOCKS_USER / SOCKS_PASS, so the test knows the credentials
-      - WG_HUB_IP -> bind_host, because the shipped proxy accepts ONLY the hub
-        (10.200.0.1) and drops everything else. That check is correct and is
-        asserted statically by SourceInspectionTests; redirecting the address
-        here is what lets the destination/auth/counter logic be exercised over a
-        real socket at all.
+    The shipped proxy accepts ONLY the hub (10.200.0.1) and drops
+    everything else, so the hub address is given as the loopback the test
+    connects from: that check is correct, and redirecting it here is what
+    lets the destination, authentication and counter logic be exercised over
+    a real socket at all.
     """
-    body = extract_socks5()
-    body = body.replace('"${SOCKS_USER}"', repr(USER)).replace('"${SOCKS_PASS}"', repr(PASSWORD))
-    body = re.sub(r'WG_HUB_IP = "[^"]*"', f'WG_HUB_IP = "{bind_host}"', body)
-    tmp = Path(tempfile.mkdtemp())
-    path = tmp / "socks5.py"
-    path.write_text(body)
+    binary = build_binary()
     proc = subprocess.Popen(
-        [sys.executable, str(path), str(port), bind_host],
+        [str(binary), "serve",
+         "--addr", bind_host, "--port", str(port),
+         "--user", USER, "--password", PASSWORD,
+         "--hub-ip", bind_host],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     # Wait for the listener rather than sleeping a fixed amount.
@@ -74,7 +69,7 @@ def build_proxy(port: int, bind_host: str) -> Path:
     while time.time() < deadline:
         try:
             with socket.create_connection((bind_host, port), timeout=0.2):
-                return path, proc
+                return binary, proc
         except OSError:
             if proc.poll() is not None:
                 raise RuntimeError(proc.stderr.read().decode())
@@ -96,7 +91,7 @@ class ProxyUnderTest(unittest.TestCase):
         probe.bind(("127.0.0.1", 0))
         cls.PORT = probe.getsockname()[1]
         probe.close()
-        cls.path, cls.proc = build_proxy(cls.PORT, cls.bind_host)
+        cls.path, cls.proc = start_proxy(cls.PORT, cls.bind_host)
 
     @classmethod
     def tearDownClass(cls):
@@ -116,7 +111,13 @@ class ProxyUnderTest(unittest.TestCase):
                   skip_auth=False):
         """Perform a SOCKS5 CONNECT; returns (sock, reply_byte)."""
         s = self.connect()
-        s.sendall(b"\x05\x02\x00\x00")          # version, methods: user/pass
+        if skip_auth:
+            # A client that offers ONLY "no authentication" - which is not
+            # on offer, so the server has nothing to negotiate with.
+            s.sendall(b"\x05\x01\x00")
+        else:
+            # The methods on offer: no-auth and username/password.
+            s.sendall(b"\x05\x02\x00\x02")
         methods = s.recv(2)
         if not methods or methods[0] != 5:
             s.close()
@@ -146,24 +147,20 @@ class ProxyUnderTest(unittest.TestCase):
         return s, (reply[1] if len(reply) > 1 else None)
 
 
-class ExtractionTests(unittest.TestCase):
-    def test_installer_embeds_a_proxy(self):
-        self.assertIn("socks5.py", INSTALLER.read_text())
+class BinaryTests(unittest.TestCase):
+    """The proxy is the binary, so the binary is what these test."""
 
-    def test_extracted_source_is_valid_python(self):
-        path = Path(tempfile.mkdtemp()) / "socks5.py"
-        path.write_text(extract_socks5().replace('"${SOCKS_USER}"', '"u"')
-                        .replace('"${SOCKS_PASS}"', '"p"'))
-        subprocess.run([sys.executable, "-m", "py_compile", str(path)], check=True)
+    def test_the_installer_installs_the_binary(self):
+        self.assertIn("ai-gateway-proxy", INSTALLER.read_text())
 
-    def test_proxy_uses_the_rfc1929_auth_method(self):
-        self.assertIn("b'\\x05\\x02'", extract_socks5())
+    def test_the_binary_has_a_serve_command(self):
+        binary = build_binary()
+        out = subprocess.run([str(binary), "--help"], capture_output=True, text=True)
+        self.assertIn("serve", out.stdout + out.stderr)
 
-    def test_proxy_does_not_bind_wildcard_by_default(self):
-        body = extract_socks5()
-        # argv[2] is the WireGuard address; the fallback must stay loopback or a
-        # missing value would expose the proxy on every interface.
-        self.assertIn('sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"', body)
+    def test_the_proxy_does_not_bind_wildcard_by_default(self):
+        """A missing address would expose the proxy on every interface."""
+        self.assertIn('"127.0.0.1"', (REPO / "src" / "socks5" / "mod.rs").read_text())
 
 
 class DestinationRestrictionTests(ProxyUnderTest):
@@ -324,38 +321,49 @@ class ConcurrencyTests(ProxyUnderTest):
 
 
 class SourceInspectionTests(unittest.TestCase):
-    """Static checks on what actually ships."""
+    """Static checks on what actually ships.
+
+    The same guarantees the Python proxy had, read out of the Rust source
+    this time: the source check comes before the counter, the counter is
+    given back however the connection ends, the destination is resolved
+    once and the resolved ADDRESS is what is connected to, and every
+    answer has to be global.
+    """
 
     def setUp(self):
-        self.body = extract_socks5()
+        self.server = (REPO / "src" / "socks5" / "server.rs").read_text()
+        self.filter = (REPO / "src" / "socks5" / "filter.rs").read_text()
 
-    def test_counter_is_decremented_in_a_finally(self):
-        self.assertIn("finally:", self.body)
-        self.assertRegex(self.body, r"finally:\s*\n\s*with conn_lock:\s*\n\s*active_conns -= 1")
+    def test_the_slot_is_given_back_however_the_connection_ends(self):
+        """The counter is a Drop, so an error path cannot leak it."""
+        self.assertIn("impl Drop for Slot", self.server)
+        self.assertRegex(self.server, r"impl Drop for Slot[\s\S]{0,200}fetch_sub")
 
-    def test_source_check_precedes_the_counter_increment(self):
-        # The bug that mattered: incrementing first meant rejected connections
-        # never released their slot.
-        accept = self.body.index("c, addr = s.accept()")
-        check = self.body.index("if addr[0] != WG_HUB_IP:")
-        bump = self.body.index("active_conns += 1")
-        self.assertLess(accept, check)
-        self.assertLess(check, bump, "counter is incremented before the source check")
+    def test_the_source_check_precedes_the_counter_increment(self):
+        """The bug that mattered: incrementing first meant rejected
+        connections never released their slot."""
+        check = self.server.index("if !from_hub(")
+        bump = self.server.index("clients.fetch_add(1")
+        self.assertLess(check, bump, "the counter is incremented before the source check")
 
-    def test_destination_is_resolved_once_and_validated(self):
-        # Resolve-then-connect is what defeats DNS rebinding.
-        self.assertIn("_resolve_safe", self.body)
-        self.assertIn("socket.create_connection((resolved, port)", self.body)
-        self.assertNotRegex(self.body, r"create_connection\(\(addr,")
+    def test_the_destination_is_resolved_once_and_validated(self):
+        """Resolve-then-connect is what defeats DNS rebinding: the
+        connection is made to the address that was checked, not to the name
+        that was asked for."""
+        self.assertIn("filter::allowed_targets", self.server)
+        self.assertIn("SocketAddr::new(target, request.port)", self.server)
+        self.assertNotIn("SocketAddr::new(request.host", self.server)
 
     def test_resolve_requires_every_answer_to_be_global(self):
-        self.assertRegex(
-            self.body,
-            r"not all\(ipaddress\.ip_address\(i\)\.is_global for i in ips\)",
-        )
+        self.assertRegex(self.filter, r"\.all\(is_global\)")
 
     def test_resolve_requires_port_443(self):
-        self.assertRegex(self.body, r"if port != 443:\s*\n\s*return None")
+        self.assertRegex(self.filter, r"const ALLOWED_PORT: u16 = 443")
+        self.assertRegex(self.filter, r"port != ALLOWED_PORT")
+
+    def test_the_proxy_does_not_bind_wildcard_by_default(self):
+        """A missing address would expose the proxy on every interface."""
+        self.assertIn('"127.0.0.1"', (REPO / "src" / "socks5" / "mod.rs").read_text())
 
 
 if __name__ == "__main__":

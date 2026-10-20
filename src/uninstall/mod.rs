@@ -30,6 +30,9 @@ use crate::run;
 const STATE_DIR: &str = "/opt/proxy-node";
 const TOKEN_PATH: &str = "/opt/proxy-node/token";
 const NODE_NAME_PATH: &str = "/opt/proxy-node/node_name";
+/// The node's own program. It is not on the machine until the node is
+/// installed, so it goes when the node is uninstalled.
+const BINARY_PATH: &str = "/usr/local/bin/ai-gateway-proxy";
 
 /// Where the installer left what it remembers about the machine's WARP
 /// and its resolver. Both belong to the machine rather than to the node.
@@ -37,7 +40,6 @@ const WARP_STATE_DIR: &str = "/etc/proxy-node-warp";
 
 const TORRC: &str = "/etc/tor/torrc";
 const TORRC_BACKUP: &str = "/etc/tor/torrc.bak";
-const RESOLV_CONF: &str = "/etc/resolv.conf";
 const WG_CONFIG: &str = "/etc/wireguard/wg0.conf";
 
 /// The hub, unless the environment says otherwise.
@@ -365,6 +367,11 @@ fn remove_files() -> Vec<String> {
     if remove_file(Path::new(WATCHDOG_SCRIPT)) {
         removed.push(WATCHDOG_SCRIPT.to_string());
     }
+    // The binary itself. The machine did not have it before the node did,
+    // and leaving it behind is not "putting the machine back".
+    if remove_file(Path::new(BINARY_PATH)) {
+        removed.push(BINARY_PATH.to_string());
+    }
     if remove_dir(Path::new(STATE_DIR)) {
         removed.push(STATE_DIR.to_string());
     }
@@ -436,43 +443,41 @@ fn trailing_port(mode: &str) -> Option<String> {
 }
 
 /// Give the machine its resolver back.
+///
+/// The logic is the install's, not a copy of it: the install knows how the
+/// machine keeps its resolver - a plain file, a systemd-resolved stub, or a
+/// NetworkManager link - and the uninstaller has to put it back the same
+/// way it was taken away.
 fn restore_resolver(removed: &mut Removed) {
     let file = Path::new(WARP_STATE_DIR).join("resolvers");
     if !file.exists() {
         return;
     }
     let text = fs_util::read_to_string(&file).unwrap_or_default();
-    let servers: Vec<&str> = text.split_whitespace().collect();
+    let servers: Vec<String> = text
+        .split_whitespace()
+        .map(|server| server.to_string())
+        .collect();
     if servers.is_empty() {
         return;
     }
-    let resolv = Path::new(RESOLV_CONF);
-    // A resolver file owned by systemd-resolved is a symlink to the stub,
-    // and the stub always answers; it asks the link, not that file.
-    // Writing into it breaks resolved.
-    if is_symlink(resolv) {
-        log::warn("/etc/resolv.conf is a symlink (systemd-resolved); left as it is");
-        return;
-    }
-    let content: String = servers
-        .iter()
-        .map(|server| format!("nameserver {server}\n"))
-        .collect();
-    match fs_util::write_file(resolv, &content, 0o644) {
-        Ok(()) => {
+    match crate::install::warp_dns::restore(&servers) {
+        crate::install::warp_dns::Verdict::Kept | crate::install::warp_dns::Verdict::Replaced => {
             removed.resolver_restored = true;
             log::step("System resolver restored");
         }
-        Err(message) => log::warn(&format!("could not restore the resolver: {message}")),
+        crate::install::warp_dns::Verdict::Filled => {
+            removed.resolver_restored = true;
+            log::step("System resolver put back");
+        }
+        crate::install::warp_dns::Verdict::Unreachable => {
+            log::warn("the machine's resolver could not be reached, so it was left as it is")
+        }
+        crate::install::warp_dns::Verdict::NoFallback => {
+            log::warn("the machine's resolver could not be put back")
+        }
     }
     let _ = std::fs::remove_dir_all(WARP_STATE_DIR);
-}
-
-/// Is this path a symlink?
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false)
 }
 
 /// A file the installer wrote, read back and trimmed.

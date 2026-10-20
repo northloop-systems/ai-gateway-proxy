@@ -29,7 +29,6 @@ VERSION="1.0.0"
 REPO="northloop-systems/ai-gateway-proxy"
 BINARY_NAME="ai-gateway-proxy"
 INSTALL_PATH="/usr/local/bin/ai-gateway-proxy"
-STATE_DIR="/opt/proxy-node"
 
 # Where the binary is fetched from, in the order it is tried. The first
 # one is the hub's own domain, so a friend is not pulled through GitHub to
@@ -43,7 +42,7 @@ MIRRORS=(
 # The SHA-256 of the binary this version of the script installs. A mismatch
 # stops the install: a binary that is not the one this script was written
 # for is a binary nobody has read.
-SHA256="__SHA256__"
+SHA256="35ea014d001a9fef6fa9cf610220b112ef09c47007d2f64e1447206da766c610"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
