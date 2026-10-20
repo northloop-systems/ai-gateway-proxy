@@ -37,8 +37,9 @@ it does.
 ## How it is put together
 
 `install.sh` is the part you read before running it as root. It fetches the
-`ai-gateway-proxy` binary, checks it against a SHA-256 pinned in the script,
-and runs it. The binary is one static file with no dependencies.
+`ai-gateway-proxy` binary from the latest release, checks it against the
+checksum published with that release, and runs it. The binary is one static
+file with no dependencies.
 
 The rest is in `src/`, one concern per file. `ai-gateway-proxy status` says
 what is working; `ai-gateway-proxy watchdog` checks the tunnel and puts it
