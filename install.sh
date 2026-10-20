@@ -11,12 +11,10 @@
 # so the thing that ends up running as root is something you can read in
 # one sitting, and there is no second file for it to go and fetch.
 #
-# The checksum is PINNED in this script, not fetched alongside the binary.
-# A checksum published next to the file it checks proves only that the two
-# arrived together; a checksum that lives here proves the binary is the
-# one this script was written for. Someone who can change the release can
-# change this script too - so if that matters to you, read the script
-# before you run it, which is the whole reason it is a script.
+# The binary comes from the latest release, so nobody has to know a version
+# number to lend a machine. The checksum is fetched with it, which proves the
+# download is the one the release published - the same trust model as any
+# package manager, where the publisher is the trust anchor.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/northloop-systems/ai-gateway-proxy/main/install.sh | sudo bash
@@ -27,22 +25,9 @@ set -euo pipefail
 
 VERSION="1.0.0"
 REPO="northloop-systems/ai-gateway-proxy"
+RELEASE_URL="https://github.com/${REPO}/releases/latest/download"
 BINARY_NAME="ai-gateway-proxy"
 INSTALL_PATH="/usr/local/bin/ai-gateway-proxy"
-
-# Where the binary is fetched from, in the order it is tried. The first
-# one is the hub's own domain, so a friend is not pulled through GitHub to
-# lend a machine; the release is the mirror, for when the domain is having
-# a bad day.
-MIRRORS=(
-    "https://ai.shuffled-family.com/proxy-node"
-    "https://github.com/${REPO}/releases/download/v${VERSION}"
-)
-
-# The SHA-256 of the binary this version of the script installs. A mismatch
-# stops the install: a binary that is not the one this script was written
-# for is a binary nobody has read.
-SHA256="35ea014d001a9fef6fa9cf610220b112ef09c47007d2f64e1447206da766c610"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -83,6 +68,7 @@ ASSET="${BINARY_NAME}-linux-${ARCH}"
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 BINARY_PATH="$WORKDIR/$BINARY_NAME"
+CHECKSUM_PATH="$WORKDIR/$BINARY_NAME.sha256"
 
 if [ -n "$LOCAL_BINARY" ]; then
     if [ ! -f "$LOCAL_BINARY" ]; then
@@ -96,48 +82,40 @@ else
         err "curl is needed to download the binary. Install it and run this again."
         exit 1
     fi
-    DOWNLOADED=""
-    for mirror in "${MIRRORS[@]}"; do
-        log "Downloading ${BINARY_NAME} ${VERSION} (${ASSET}) from ${mirror}..."
-        if curl -fsSL -o "$BINARY_PATH" "${mirror}/${ASSET}"; then
-            DOWNLOADED="$mirror"
-            break
-        fi
-        rm -f "$BINARY_PATH"
-    done
-    if [ -z "$DOWNLOADED" ]; then
-        err "Could not download ${ASSET} from any of them:"
-        for mirror in "${MIRRORS[@]}"; do err "  ${mirror}"; done
-        err "  You can also install a binary you have already: "
-        err "    sudo ./install.sh --local ./ai-gateway-proxy"
+    log "Downloading ${BINARY_NAME} (${ASSET}) from the latest release..."
+    if ! curl -fsSL -o "$BINARY_PATH" "${RELEASE_URL}/${ASSET}"; then
+        err "Could not download ${RELEASE_URL}/${ASSET}"
+        err "  The release may not be published yet. You can also install a binary"
+        err "  you have already: sudo ./install.sh --local ./ai-gateway-proxy"
         exit 1
     fi
-    log "Downloaded from ${DOWNLOADED}"
-fi
+    # The checksum comes with the release, so the two are the same thing.
+    if ! curl -fsSL -o "$CHECKSUM_PATH" "${RELEASE_URL}/${ASSET}.sha256"; then
+        err "Could not download the checksum for ${ASSET}."
+        err "  Without it there is nothing to check the binary against, so it is"
+        err "  not being run."
+        exit 1
+    fi
 
-# --- Check it ---------------------------------------------------------------
-# The binary is what runs as root, so this is the one moment where it
-# matters that the file is the one we expect.
-if [ "$SHA256" = "__SHA256__" ]; then
-    err "This script has no pinned checksum for the binary."
-    err "  That is a bug in the installer, not something to work around."
-    exit 1
+    # --- Check it -----------------------------------------------------------
+    # The binary is what runs as root, so this is the one moment where it
+    # matters that the file is the one the release published.
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        err "sha256sum is needed to check the binary. Install coreutils and run this again."
+        exit 1
+    fi
+    EXPECTED=$(cut -d' ' -f1 < "$CHECKSUM_PATH")
+    ACTUAL=$(sha256sum "$BINARY_PATH" | cut -d' ' -f1)
+    if [ "$ACTUAL" != "$EXPECTED" ]; then
+        err "The binary's checksum does not match the one published with it."
+        err "  expected: $EXPECTED"
+        err "  got:      $ACTUAL"
+        err "  It is not being run. If you trust it anyway, install it by hand:"
+        err "    sudo install -m 0755 $BINARY_PATH $INSTALL_PATH"
+        exit 1
+    fi
+    log "Checksum verified: $ACTUAL"
 fi
-if ! command -v sha256sum >/dev/null 2>&1; then
-    err "sha256sum is needed to check the binary. Install coreutils and run this again."
-    exit 1
-fi
-ACTUAL=$(sha256sum "$BINARY_PATH" | cut -d' ' -f1)
-if [ "$ACTUAL" != "$SHA256" ]; then
-    err "The binary's checksum does not match."
-    err "  expected: $SHA256"
-    err "  got:      $ACTUAL"
-    err "  This binary is not the one this script was written for, so it is not"
-    err "  being run. If you trust it anyway, install it by hand:"
-    err "    sudo install -m 0755 $BINARY_PATH $INSTALL_PATH"
-    exit 1
-fi
-log "Checksum verified: $ACTUAL"
 
 # --- Put it where it belongs -------------------------------------------------
 install -m 0755 "$BINARY_PATH" "$INSTALL_PATH"

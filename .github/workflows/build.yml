@@ -77,27 +77,8 @@ jobs:
             dist/ai-gateway-proxy-linux-arm64.sha256
             dist/SHA256SUMS
           body: |
-            The node binary. The installer checks the SHA-256 pinned in
-            `install.sh` before it runs anything, so the checksum files here
-            are for convenience, not what the installer relies on.
+            The node binary, and the checksum for each of them.
 
-      - name: Propose the new pin for the installer
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: |
-          HASH=$(sha256sum dist/ai-gateway-proxy-linux-amd64 | cut -d' ' -f1)
-          VERSION="1.0.0"
-          {
-            echo "The amd64 binary for v${VERSION}, and its checksum."
-            echo
-            echo "The installer fetches the binary from the hub's domain first"
-            echo "and the release as a mirror, and refuses to run anything whose"
-            echo "checksum is not the one pinned below."
-          } > /tmp/note.md
-          sed -i "s|^SHA256=.*|SHA256=\"${HASH}\"|" install.sh
-          git config user.name "release-bot"
-          git config user.email "release-bot@users.noreply.github.com"
-          git checkout -b release/pin-${{ github.run_number }}
-          git add install.sh
-          git commit -m "installer: pin the v${VERSION} binary"
-          git push -u origin release/pin-${{ github.run_number }}
-          gh pr create --title "Pin the v${VERSION} binary" --body-file /tmp/note.md || true
+            The installer fetches the latest release and checks the binary
+            against the `.sha256` published beside it, so a download that
+            did not arrive intact is not run.

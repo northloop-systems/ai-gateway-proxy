@@ -64,23 +64,10 @@ class ShellTests(unittest.TestCase):
 
 class ChecksumTests(unittest.TestCase):
     """The one moment where it matters that the binary is the one the
-    script was written for."""
+    release published."""
 
-    def test_a_checksum_is_pinned(self):
-        match = re.search(r'(?m)^SHA256="([0-9a-f]*)"$', SRC)
-        self.assertIsNotNone(match, "the script pins no SHA-256")
-        self.assertNotEqual(
-            match.group(1), "", "the pinned SHA-256 is empty"
-        )
-
-    def test_a_missing_checksum_stops_the_install(self):
-        """A script with no pinned checksum is a bug, not something to work
-        around - so it must not fall through to running the binary."""
-        self.assertIn('if [ "$SHA256" = "__SHA256__" ]; then', SRC)
-        self.assertRegex(
-            SRC, r"__SHA256__[\s\S]{0,400}exit 1",
-            "the placeholder does not stop the install",
-        )
+    def test_the_checksum_comes_with_the_binary(self):
+        self.assertIn("${RELEASE_URL}/${ASSET}.sha256", SRC)
 
     def test_the_binary_is_checked_before_it_is_run(self):
         checksum_at = SRC.index("sha256sum")
@@ -91,17 +78,22 @@ class ChecksumTests(unittest.TestCase):
         self.assertIn("does not match", SRC)
         self.assertRegex(SRC, r"does not match[\s\S]{0,400}exit 1", "a mismatch does not stop the install")
 
+    def test_a_missing_checksum_stops_the_install(self):
+        """Without a checksum there is nothing to check the binary against,
+        and the binary is what runs as root."""
+        self.assertRegex(
+            SRC, r"Could not download the checksum[\s\S]{0,400}exit 1",
+            "a missing checksum does not stop the install",
+        )
+
+    def test_the_latest_release_is_fetched(self):
+        """Nobody has to know a version number to lend a machine."""
+        self.assertIn("releases/latest/download", SRC)
+
 
 class DownloadTests(unittest.TestCase):
-    def test_the_hub_domain_is_the_first_mirror(self):
-        mirrors = re.search(r"(?ms)^MIRRORS=\(\n(.*?)^\)", SRC)
-        self.assertIsNotNone(mirrors, "no mirrors are listed")
-        first = mirrors.group(1).strip().splitlines()[0]
-        self.assertIn("ai.shuffled-family.com", first)
-
-    def test_every_mirror_is_tried(self):
-        self.assertIn("for mirror in", SRC)
-        self.assertIn("Downloaded from", SRC)
+    def test_the_release_is_where_the_binary_comes_from(self):
+        self.assertIn("github.com/${REPO}/releases/latest/download", SRC)
 
     def test_both_architectures_are_offered(self):
         self.assertIn("x86_64|amd64", SRC)
@@ -177,7 +169,7 @@ class RepositoryTests(unittest.TestCase):
     def test_the_binary_is_built_for_both_architectures(self):
         workflow = (REPO / ".github" / "workflows" / "build.yml").read_text()
         self.assertIn("x86_64-unknown-linux-musl", workflow)
-        self.assertIn("aarch64-unknown-linux-gnu", workflow)
+        self.assertIn("aarch64-unknown-linux-musl", workflow)
 
     def test_the_release_publishes_the_checksums(self):
         workflow = (REPO / ".github" / "workflows" / "build.yml").read_text()
