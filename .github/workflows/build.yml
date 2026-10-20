@@ -51,10 +51,13 @@ jobs:
           # file that runs anywhere a Linux kernel does. The aarch64 build
           # uses Rust's own linker, so no cross-toolchain is needed.
           #
-          # The tag is stamped into the binary, so `ai-gateway-proxy version`
-          # on an installed node says WHICH release it is - otherwise every
-          # release reports the same version and nobody can tell.
-          VERSION="${GITHUB_REF_NAME#v}"
+          # The release tag is stamped into the binary, so
+          # `ai-gateway-proxy version` on an installed node says WHICH
+          # release it is - otherwise every release reports the same
+          # version and nobody can tell. The tag is the run number (see the
+          # publish step), NOT the branch: a build from a push to main is
+          # published as vN, and stamping it "main" would say nothing.
+          VERSION="v${{ github.run_number }}"
           export AI_GATEWAY_PROXY_VERSION="$VERSION"
           cargo build --release --target $MUSL
           cp target/$MUSL/release/ai-gateway-proxy dist/ai-gateway-proxy-linux-amd64
