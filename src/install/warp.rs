@@ -28,6 +28,22 @@ use std::path::Path;
 /// The mode WARP has to be in: a proxy the node's exits can use.
 const WANTED_MODE: &str = "proxy";
 
+/// The mode, in the words warp-cli uses.
+///
+/// This version of warp-cli calls proxy mode "WarpProxy" and an older one
+/// calls it "proxy"; both mean the same thing, and the check has to
+/// recognise both. A WARP that IS a proxy reported as "not a proxy" is a
+/// false alarm that reads exactly like a fault, and it is the kind of thing
+/// that sends someone hunting for a problem that is not there.
+fn canonical_mode(mode: &str) -> &str {
+    match mode {
+        "proxy" | "warpproxy" => "proxy",
+        "warp" => "warp",
+        "dns" => "dns",
+        other => other,
+    }
+}
+
 /// Where the state the uninstaller needs is kept.
 const STATE_DIR: &str = "/etc/proxy-node-warp";
 
@@ -82,7 +98,7 @@ pub fn configure_proxy_mode(port: u16) -> Result<(), String> {
     // sends the machine's own traffic through Cloudflare, which is the
     // one thing this module must never cause.
     match current_mode() {
-        Some(mode) if mode == WANTED_MODE => {}
+        Some(mode) if canonical_mode(&mode) == WANTED_MODE => {}
         Some(mode) => {
             return Err(format!(
                 "WARP says it is in {mode} mode, not {WANTED_MODE} mode. \
@@ -254,8 +270,23 @@ mod tests {
     }
 
     #[test]
-    fn the_mode_is_read_in_lower_case() {
-        // Some versions print "Mode: Proxy"; the comparison must not
+    fn this_version_of_warp_cli_calls_proxy_mode_warpproxy() {
+        // It says so, and it is right: "WarpProxy on port 40000" IS proxy
+        // mode. Reporting it as "not proxy mode" is a false alarm that reads
+        // exactly like a fault.
+        assert_eq!(
+            canonical_mode(&mode_from_settings(
+                "(user set)\tMode: WarpProxy on port 40000\n"
+            )
+            .unwrap_or_default()),
+            "proxy"
+        );
+        assert_eq!(canonical_mode("warp"), "warp");
+        assert_eq!(canonical_mode("dns"), "dns");
+    }
+
+    #[test]
+    fn the_mode_is_read_in_lower_case() {        // Some versions print "Mode: Proxy"; the comparison must not
         // depend on the capitalisation.
         assert_eq!(
             mode_from_settings("Mode: Proxy\n"),
