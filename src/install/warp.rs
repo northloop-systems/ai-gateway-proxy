@@ -275,10 +275,10 @@ mod tests {
         // mode. Reporting it as "not proxy mode" is a false alarm that reads
         // exactly like a fault.
         assert_eq!(
-            canonical_mode(&mode_from_settings(
-                "(user set)\tMode: WarpProxy on port 40000\n"
-            )
-            .unwrap_or_default()),
+            canonical_mode(
+                &mode_from_settings("(user set)\tMode: WarpProxy on port 40000\n")
+                    .unwrap_or_default()
+            ),
             "proxy"
         );
         assert_eq!(canonical_mode("warp"), "warp");
@@ -286,7 +286,8 @@ mod tests {
     }
 
     #[test]
-    fn the_mode_is_read_in_lower_case() {        // Some versions print "Mode: Proxy"; the comparison must not
+    fn the_mode_is_read_in_lower_case() {
+        // Some versions print "Mode: Proxy"; the comparison must not
         // depend on the capitalisation.
         assert_eq!(
             mode_from_settings("Mode: Proxy\n"),
