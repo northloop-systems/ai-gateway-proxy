@@ -17,7 +17,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   MUSL: x86_64-unknown-linux-musl
-  GNULL: aarch64-unknown-linux-gnu
+  ARM: aarch64-unknown-linux-musl
 
 jobs:
   build:
@@ -32,7 +32,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
-          rustup target add $MUSL $GNULL
+          rustup target add $MUSL $ARM
           rustc --version && cargo --version
 
       - name: Check the formatting
@@ -47,12 +47,13 @@ jobs:
       - name: Build
         run: |
           mkdir -p dist
-          # The musl build is fully static: no glibc, no interpreter, one
-          # file that runs anywhere a Linux kernel does.
+          # Both builds are musl and static: no glibc, no interpreter, one
+          # file that runs anywhere a Linux kernel does. The aarch64 build
+          # uses Rust's own linker, so no cross-toolchain is needed.
           cargo build --release --target $MUSL
           cp target/$MUSL/release/ai-gateway-proxy dist/ai-gateway-proxy-linux-amd64
-          cargo build --release --target $GNULL
-          cp target/$GNULL/release/ai-gateway-proxy dist/ai-gateway-proxy-linux-arm64
+          RUSTFLAGS="-C linker=rust-lld" cargo build --release --target $ARM
+          cp target/$ARM/release/ai-gateway-proxy dist/ai-gateway-proxy-linux-arm64
 
       - name: Checksums
         run: |
