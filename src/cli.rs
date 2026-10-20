@@ -5,7 +5,17 @@
 
 use std::collections::BTreeMap;
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version this binary reports.
+///
+/// The release build stamps the tag it was cut from, so `ai-gateway-proxy
+/// version` says WHICH release is installed on a machine - which is the
+/// only way to tell "this node is on the version with the WARP fix" from
+/// "this node is on the version before it". A build from a working tree
+/// says the crate version, because there is no tag to stamp.
+pub const VERSION: &str = match option_env!("AI_GATEWAY_PROXY_VERSION") {
+    Some(stamped) => stamped,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 #[derive(Debug, Default, Clone)]
 pub struct InstallOptions {

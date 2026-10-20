@@ -50,6 +50,12 @@ jobs:
           # Both builds are musl and static: no glibc, no interpreter, one
           # file that runs anywhere a Linux kernel does. The aarch64 build
           # uses Rust's own linker, so no cross-toolchain is needed.
+          #
+          # The tag is stamped into the binary, so `ai-gateway-proxy version`
+          # on an installed node says WHICH release it is - otherwise every
+          # release reports the same version and nobody can tell.
+          VERSION="${GITHUB_REF_NAME#v}"
+          export AI_GATEWAY_PROXY_VERSION="$VERSION"
           cargo build --release --target $MUSL
           cp target/$MUSL/release/ai-gateway-proxy dist/ai-gateway-proxy-linux-amd64
           RUSTFLAGS="-C linker=rust-lld" cargo build --release --target $ARM

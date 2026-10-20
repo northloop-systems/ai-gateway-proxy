@@ -19,9 +19,19 @@ pub fn run() -> Result<(), String> {
     let node_name = read_state("node_name");
     log::plain(&format!(
         "  Node:        {}",
-        node_name
-            .clone()
-            .unwrap_or_else(|| "not registered".to_string())
+        match &node_name {
+            Some(name) => name.clone(),
+            // "not registered" is a statement about the node, and it is
+            // wrong for anyone who cannot read the state: the state holds
+            // the SOCKS password, so it is root-only, and a plain `status`
+            // from the person's own account reads nothing. Saying
+            // "not registered" sends them hunting a problem that is not
+            // there.
+            None => match state_unreadable() {
+                true => "unknown (the state is root-only: run status as root)".to_string(),
+                false => "not registered".to_string(),
+            },
+        }
     ));
 
     let tunnel = systemd::is_active("wg-quick@wg0");
@@ -77,12 +87,100 @@ fn yes_no(value: bool) -> &'static str {
 }
 
 fn read_state(name: &str) -> Option<String> {
-    let path = std::path::Path::new(STATE_DIR).join(name);
+    read_state_in(STATE_DIR, name)
+}
+
+fn read_state_in(dir: &str, name: &str) -> Option<String> {
+    let path = std::path::Path::new(dir).join(name);
     let text = fs_util::read_to_string(&path)?;
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed)
+    }
+}
+
+/// True when the state directory is there but cannot be read.
+///
+/// The state holds the SOCKS password, so it is root-only on purpose. A
+/// status run by the person who lent the machine cannot read it, and
+/// "not registered" would be a lie about the node.
+fn state_unreadable() -> bool {
+    state_unreadable_in(STATE_DIR)
+}
+
+fn state_unreadable_in(dir: &str) -> bool {
+    let dir = std::path::Path::new(dir);
+    dir.exists() && fs_util::read_to_string(&dir.join("node_name")).is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ai-gateway-proxy-status-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn a_state_that_names_a_node_is_read() {
+        let dir = temp_dir("named");
+        let path = dir.join("node_name");
+        std::fs::write(&path, "laptop\n").unwrap();
+        assert_eq!(
+            read_state_in(dir.to_str().unwrap(), "node_name").as_deref(),
+            Some("laptop")
+        );
+        assert!(!state_unreadable_in(dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_state_directory_that_is_not_readable_is_not_a_missing_registration() {
+        // The state holds the SOCKS password, so it is root-only. A status
+        // run by the person who lent the machine cannot read it, and
+        // "not registered" would be a lie about the node.
+        let dir = temp_dir("unreadable");
+        let path = dir.join("node_name");
+        std::fs::write(&path, "laptop\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        let _ = std::fs::set_permissions(&dir, perms);
+        let unreadable = state_unreadable_in(dir.to_str().unwrap());
+        // Running as root, the 0000 directory is still readable - so the
+        // check is only meaningful for an unprivileged reader.
+        if unsafe { libc_geteuid() } != 0 {
+            assert!(
+                unreadable,
+                "an unreadable state must not read as a missing node"
+            );
+        }
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o700);
+        let _ = std::fs::set_permissions(&dir, perms);
+    }
+
+    #[test]
+    fn a_missing_state_directory_is_a_missing_registration() {
+        let dir = temp_dir("missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!state_unreadable_in(dir.to_str().unwrap()));
+        assert_eq!(read_state_in(dir.to_str().unwrap(), "node_name"), None);
+    }
+
+    #[test]
+    fn the_version_is_never_empty() {
+        assert!(!crate::cli::VERSION.is_empty());
+    }
+
+    unsafe fn libc_geteuid() -> u32 {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        geteuid()
     }
 }
