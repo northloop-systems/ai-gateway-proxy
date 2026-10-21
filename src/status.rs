@@ -39,13 +39,41 @@ pub fn run() -> Result<(), String> {
 
     for (label, unit) in [
         ("Tor exit:", "proxy-tor-redirect"),
-        ("WARP exit:", "proxy-warp-redirect"),
         ("Direct exit:", "proxy-socks5"),
     ] {
         log::plain(&format!(
             "  {label}    {}",
             yes_no(systemd::is_active(unit))
         ));
+    }
+
+    // The WARP mode, because in tunnel mode there is no WARP exit to
+    // report: the machine's own address is the WARP address. Saying
+    // "WARP exit: no" there would look like a fault, and it is not one -
+    // it is what the owner asked for.
+    //
+    // The node's own choice is read first, and the machine's ACTUAL mode
+    // is the fallback, because the state file is root-only and the person
+    // who lent the machine is not root.
+    let warp_mode = crate::install::warp::persisted_node_mode().or_else(|| {
+        crate::install::warp::current_mode().and_then(|m| crate::install::warp::Mode::parse(&m))
+    });
+    match warp_mode {
+        Some(crate::install::warp::Mode::Proxy) => {
+            log::plain(
+                "  WARP mode:   proxy (the node's own WARP port; the machine's traffic stays put)",
+            );
+            log::plain(&format!(
+                "  WARP exit:   {}",
+                yes_no(systemd::is_active("proxy-warp-redirect"))
+            ));
+        }
+        Some(crate::install::warp::Mode::Tunnel) => {
+            log::plain("  WARP mode:   tunnel (the machine's traffic and its DNS go through WARP)");
+        }
+        None => {
+            log::plain("  WARP mode:   unknown (warp-cli is not installed, or said nothing)");
+        }
     }
 
     // The watchdog: is it even installed, and did it last have anything

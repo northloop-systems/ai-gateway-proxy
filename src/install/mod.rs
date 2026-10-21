@@ -88,6 +88,20 @@ pub fn run(options: &InstallOptions) -> Result<(), String> {
         direct: options.ports.get("direct").copied().unwrap_or(1080),
     };
 
+    // The WARP mode is the OWNER'S choice, and it is remembered: an
+    // install that was not told otherwise keeps the mode this node was set
+    // up with, so a machine that was deliberately put in tunnel mode is not
+    // quietly put back into proxy mode by a re-install.
+    let warp_mode = options
+        .warp_mode
+        .or_else(warp::persisted_node_mode)
+        .unwrap_or(warp::Mode::Proxy);
+    if let Err(reason) = warp::remember_node_mode(warp_mode) {
+        log::warn(&format!(
+            "could not remember the WARP mode for later: {reason}"
+        ));
+    }
+
     log::step("Installing the packages the node needs...");
     if let Err(message) = packages::install_required() {
         log::warn(&format!("could not install every package: {message}"));
@@ -110,7 +124,7 @@ pub fn run(options: &InstallOptions) -> Result<(), String> {
     }
     let warp_available = warp::available();
     if warp_available {
-        if let Err(message) = warp::configure_proxy_mode(ports.warp) {
+        if let Err(message) = warp::configure(warp_mode, ports.warp) {
             log::warn(&format!("WARP could not be configured: {message}"));
         }
         // The switch may have taken the resolver with it. Put the machine's
@@ -164,11 +178,7 @@ pub fn run(options: &InstallOptions) -> Result<(), String> {
         public_ip: os_info::public_ip(),
         socks_user: generate_socks_user(),
         socks_pass: generate_socks_password(),
-        ports: vec![
-            ("tor".to_string(), ports.tor as i64),
-            ("warp".to_string(), ports.warp as i64),
-            ("direct".to_string(), ports.direct as i64),
-        ],
+        ports: exit_ports(&ports, warp_mode),
     };
     let response = hub.register(&request)?;
     if response.status != "ok" {
@@ -243,11 +253,16 @@ pub fn run(options: &InstallOptions) -> Result<(), String> {
             units::tor_redirect_unit_on(&response.wireguard_ip, ports.tor),
         ),
     ];
-    if warp_available {
+    if warp_available && warp_mode.offers_warp_exit() {
         unit_files.push((
             "/etc/systemd/system/proxy-warp-redirect.service".to_string(),
             units::warp_redirect_unit_on(&response.wireguard_ip, ports.warp),
         ));
+    } else if warp_available {
+        // A node that was in proxy mode and is now in tunnel mode must not
+        // keep the bridge: there is no WARP port for it to forward to, and
+        // a bridge to a dead port is an exit the hub would keep trying.
+        systemd::remove(&["proxy-warp-redirect.service"])?;
     }
     unit_files.push((
         "/etc/systemd/system/proxy-tunnel-watchdog.service".to_string(),
@@ -277,9 +292,25 @@ pub fn run(options: &InstallOptions) -> Result<(), String> {
             direct: ports.direct,
         },
         warp_available,
+        warp_mode,
         hub_ip: HUB_IP.to_string(),
     });
     Ok(())
+}
+
+/// The exits the node offers the hub.
+///
+/// A tunnel-mode WARP does not serve a port, so there is no separate WARP
+/// exit to offer: the machine's own address IS the WARP address, and
+/// offering a port that can never answer would advertise an exit that
+/// only ever fails.
+fn exit_ports(ports: &ExitPorts, warp_mode: warp::Mode) -> Vec<(String, i64)> {
+    let mut offered = vec![("tor".to_string(), ports.tor as i64)];
+    if warp_mode.offers_warp_exit() {
+        offered.push(("warp".to_string(), ports.warp as i64));
+    }
+    offered.push(("direct".to_string(), ports.direct as i64));
+    offered
 }
 
 /// Wait for the tunnel to be up, for a few seconds.
@@ -436,5 +467,28 @@ mod tests {
     fn no_saved_token_is_no_token() {
         let dir = temp_dir("none");
         assert_eq!(saved_token_in(dir.to_str().unwrap()), None);
+    }
+
+    #[test]
+    fn a_proxy_mode_node_offers_three_exits() {
+        let ports = ExitPorts::default();
+        let offered = exit_ports(&ports, warp::Mode::Proxy);
+        assert_eq!(offered.len(), 3);
+        assert!(offered.contains(&("warp".to_string(), 40000)));
+        assert!(offered.contains(&("tor".to_string(), 9050)));
+        assert!(offered.contains(&("direct".to_string(), 1080)));
+    }
+
+    #[test]
+    fn a_tunnel_mode_node_offers_two_exits() {
+        // There is no WARP port to offer: a tunnel-mode WARP does not
+        // listen on one, and the machine's own address is the WARP
+        // address.
+        let ports = ExitPorts::default();
+        let offered = exit_ports(&ports, warp::Mode::Tunnel);
+        assert_eq!(offered.len(), 2);
+        assert!(!offered.iter().any(|(name, _)| name == "warp"));
+        assert!(offered.contains(&("tor".to_string(), 9050)));
+        assert!(offered.contains(&("direct".to_string(), 1080)));
     }
 }

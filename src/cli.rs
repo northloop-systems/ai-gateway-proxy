@@ -24,6 +24,9 @@ pub struct InstallOptions {
     pub endpoint: Option<String>,
     pub node_name: Option<String>,
     pub ports: BTreeMap<String, u16>,
+    /// How the node uses WARP. None means "whatever this node was set up
+    /// with", which is what keeps a machine in the mode its owner chose.
+    pub warp_mode: Option<crate::install::warp::Mode>,
 }
 
 #[derive(Debug, Default)]
@@ -72,6 +75,12 @@ OPTIONS FOR install:
     --endpoint HOST:PORT  the hub's WireGuard endpoint, when it does not say
     --node-name NAME      the name to register under (the hub's word wins)
     --port NAME=PORT      an exit's port, e.g. --port tor=9050
+    --warp-mode MODE      'proxy' (default) or 'tunnel'. Proxy: WARP serves
+                          the node a port and the machine's own traffic stays
+                          where it is. Tunnel: WARP carries the machine's
+                          traffic AND its DNS, and the node's own address is
+                          the WARP address - there is no separate WARP exit.
+                          The choice is remembered, so a re-install keeps it.
 
 OPTIONS FOR serve:
     --addr ADDRESS        the address to listen on
@@ -135,6 +144,17 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             "--server" => install.server_host = value(args, &mut i, "--server")?,
             "--endpoint" => install.endpoint = Some(value(args, &mut i, "--endpoint")?),
             "--node-name" => install.node_name = Some(value(args, &mut i, "--node-name")?),
+            "--warp-mode" => {
+                let raw = value(args, &mut i, "--warp-mode")?;
+                install.warp_mode =
+                    Some(crate::install::warp::Mode::parse(&raw).ok_or_else(|| {
+                        format!(
+                            "{raw} is not a WARP mode: it is 'proxy' (WARP serves the node a \
+                             port, and the machine's own traffic stays put) or 'tunnel' (WARP \
+                             carries the machine's traffic and its DNS)"
+                        )
+                    })?);
+            }
             "--port" => ports.push(value(args, &mut i, "--port")?),
             "--addr" => serve.listen_addr = value(args, &mut i, "--addr")?,
             "--user" => serve.username = value(args, &mut i, "--user")?,

@@ -18,6 +18,31 @@ Paste the token when asked. To uninstall:
 curl -fsSL https://raw.githubusercontent.com/northloop-systems/ai-gateway-proxy/main/uninstall.sh | sudo bash
 ```
 
+## WARP: a proxy, or a tunnel
+
+The installer puts WARP into **proxy mode**: it serves the node a SOCKS port,
+and the node's exits connect to that port. Your own browsing, streaming and
+games stay where they are, off Cloudflare's network.
+
+If you WANT your traffic and your DNS through WARP - a laptop that is meant
+to be on Cloudflare's network all the time - ask for **tunnel mode**:
+
+```bash
+sudo ai-gateway-proxy install --warp-mode tunnel
+```
+
+In tunnel mode WARP carries the machine's own traffic and its DNS, which
+means two things:
+
+- The node has **no separate WARP exit**: a tunnel-mode WARP does not listen
+  on a port, so there is nothing for the gateway to connect to. The
+  machine's own address *is* the WARP address, and that is the exit the node
+  offers in its place. The node still offers a Tor exit and its own address.
+- The choice is **remembered**, so a re-install does not quietly put a
+  machine that was deliberately in tunnel mode back into proxy mode.
+
+`ai-gateway-proxy status` says which mode the machine is in.
+
 ## Know what you are agreeing to
 
 - **Your IP makes requests to third-party services** on the gateway's behalf.
@@ -27,12 +52,13 @@ curl -fsSL https://raw.githubusercontent.com/northloop-systems/ai-gateway-proxy/
   public addresses on port 443.
 - **The installer runs as root** and changes your system: it installs
   packages, edits `/etc/tor/torrc` (backed up), and on Debian/Ubuntu it
-  registers WARP and switches it to proxy mode.
+  registers WARP and switches it to the mode the node was set up with.
 - **Don't use it on a work or school machine.** The traffic is yours.
 
 WARP is usually your machine's resolver, and switching it to proxy mode takes
 that away with it. The installer puts your resolver back and tells you when
-it does.
+it does. In tunnel mode the resolver stays WARP's - that is the point of it -
+and the machine's own is only put back if WARP's stops answering.
 
 ## How it is put together
 

@@ -1,12 +1,30 @@
 //! Cloudflare WARP, as one of the node's exits.
 //!
 //! WARP can do two very different things. In TUNNEL mode it sends the
-//! machine's OWN traffic through itself, and in PROXY mode it serves
-//! traffic that asks for it on a local port. The node wants the second:
-//! the node's exits connect to the proxy port, while the machine's owner
-//! keeps their browsing, their streaming and their games off Cloudflare's
-//! network. Tunnel mode is what breaks people's computers, and the
-//! complaint that reaches the owner of a node is not worth a WARP exit.
+//! machine's OWN traffic through itself - its browsing, its streaming, its
+//! games and its DNS - and in PROXY mode it serves traffic that asks for
+//! it on a local port.
+//!
+//! Which one a node uses is the OWNER'S choice, and the two are not
+//! merely different exits: they are different machines.
+//!
+//!   - PROXY mode is the default, because it is the one that leaves the
+//!     machine's own traffic where it was. The node's exits connect to the
+//!     proxy port, and the owner keeps their browsing, their streaming and
+//!     their games off Cloudflare's network. Tunnel mode is what breaks
+//!     people's computers, and the complaint that reaches the owner of a
+//!     node is not worth a WARP exit.
+//!   - TUNNEL mode is what an owner asks for when they WANT their traffic
+//!     and their DNS through WARP - a laptop that is meant to be on
+//!     Cloudflare's network all the time. The node then has no separate
+//!     WARP-proxy exit (a tunnel-mode WARP does not listen on a port): the
+//!     machine's own address IS a WARP address, and that is the exit the
+//!     node offers in its place.
+//!
+//! The choice is remembered (see `NODE_MODE_FILE`), so a machine that was
+//! set up one way stays that way across a re-install, and the uninstaller
+//! still gives back the mode the machine had before the node ever touched
+//! it.
 //!
 //! Two things about the tool itself:
 //!
@@ -16,17 +34,14 @@
 //!   - `registration new` fails on a machine that is already registered.
 //!     That is not a failure: the registration the node needs is there.
 //!
-//! The mode is read back afterwards, because "never leave it in tunnel
-//! mode" has to hold even when the command claimed to have worked.
+//! The mode is read back afterwards, because "the mode the owner asked for
+//! has to hold" has to hold even when the command claimed to have worked.
 
 use crate::log;
 use crate::run;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-
-/// The mode WARP has to be in: a proxy the node's exits can use.
-const WANTED_MODE: &str = "proxy";
 
 /// The mode, in the words warp-cli uses.
 ///
@@ -44,27 +59,95 @@ fn canonical_mode(mode: &str) -> &str {
     }
 }
 
+/// How a node uses WARP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// WARP serves a SOCKS port and the node's exits connect to it. The
+    /// machine's own traffic is left alone.
+    Proxy,
+    /// WARP is a real WARP: the machine's traffic AND its DNS go through
+    /// it. The node has no separate WARP-proxy exit, because a
+    /// tunnel-mode WARP does not listen on a port.
+    Tunnel,
+}
+
+impl Mode {
+    /// The name the choice is stored and printed under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Proxy => "proxy",
+            Mode::Tunnel => "tunnel",
+        }
+    }
+
+    /// The mode warp-cli calls it. Tunnel mode is called "warp" there,
+    /// because that is what it is: a tunnel.
+    fn warp_cli_name(self) -> &'static str {
+        match self {
+            Mode::Proxy => "proxy",
+            Mode::Tunnel => "warp",
+        }
+    }
+
+    /// Read a mode out of the name it was given.
+    pub fn parse(text: &str) -> Option<Mode> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "proxy" | "warpproxy" => Some(Mode::Proxy),
+            "tunnel" | "warp" => Some(Mode::Tunnel),
+            _ => None,
+        }
+    }
+
+    /// Does the node offer a separate WARP exit in this mode?
+    ///
+    /// It does not in tunnel mode: there is no port for the hub to connect
+    /// to, and offering one would advertise an exit that can never answer.
+    pub fn offers_warp_exit(self) -> bool {
+        matches!(self, Mode::Proxy)
+    }
+}
+
 /// Where the state the uninstaller needs is kept.
 const STATE_DIR: &str = "/etc/proxy-node-warp";
 
 /// The file the mode the machine had before the switch is kept in.
 const MODE_FILE: &str = "/etc/proxy-node-warp/mode";
 
+/// The file the mode the NODE was set up with is kept in.
+///
+/// It is what makes the choice survive a re-install: an install that was
+/// not told otherwise keeps the mode this file names, instead of quietly
+/// putting a machine that was deliberately in tunnel mode back into proxy
+/// mode.
+const NODE_MODE_FILE: &str = "/etc/proxy-node-warp/node-mode";
+
 /// Is WARP installed at all?
 pub fn available() -> bool {
     run::have("warp-cli")
 }
 
-/// Put WARP into proxy mode on the given port, and make sure it is
+/// The mode this node was set up with, if it was ever set up.
+pub fn persisted_node_mode() -> Option<Mode> {
+    let raw = std::fs::read_to_string(NODE_MODE_FILE).ok()?;
+    Mode::parse(raw.lines().next().unwrap_or(""))
+}
+
+/// Keep the mode the node was set up with, so the next install does not
+/// have to be told again.
+pub fn remember_node_mode(mode: Mode) -> Result<(), String> {
+    write_state(NODE_MODE_FILE, &format!("{}\n", mode.as_str()))
+}
+
+/// Put WARP into the mode the node was set up with, and make sure it is
 /// running. Returns an error when WARP is not installed or refuses.
 ///
-/// "Refuses" means the tool said no: it would not switch to proxy mode,
-/// or would not take the port. A failure to CONNECT is only a warning,
+/// "Refuses" means the tool said no: it would not switch to the mode, or
+/// would not take the port. A failure to CONNECT is only a warning,
 /// because the machine's resolver is usually still broken at this point
 /// (that is what the resolver repair is for) and the tunnel to the hub is
 /// what the node needs first. The exit comes up once the machine can
 /// resolve names again.
-pub fn configure_proxy_mode(port: u16) -> Result<(), String> {
+pub fn configure(mode: Mode, port: u16) -> Result<(), String> {
     if !available() {
         return Err(
             "Cloudflare WARP is not installed (there is no warp-cli on the PATH). \
@@ -87,29 +170,39 @@ pub fn configure_proxy_mode(port: u16) -> Result<(), String> {
     // here, because this is the last moment it is worth anything.
     remember_mode();
 
-    warp_cli_ok(&["mode", "proxy"])
-        .map_err(|reason| format!("WARP would not switch to proxy mode: {reason}"))?;
+    if mode == Mode::Proxy {
+        warp_cli_ok(&["mode", "proxy"])
+            .map_err(|reason| format!("WARP would not switch to proxy mode: {reason}"))?;
 
-    let port_arg = port.to_string();
-    warp_cli_ok(&["proxy", "port", &port_arg])
-        .map_err(|reason| format!("WARP would not take the proxy port {port}: {reason}"))?;
+        let port_arg = port.to_string();
+        warp_cli_ok(&["proxy", "port", &port_arg])
+            .map_err(|reason| format!("WARP would not take the proxy port {port}: {reason}"))?;
+    } else {
+        // Tunnel mode is what the owner asked for: the machine's traffic
+        // and its DNS go through WARP. There is no proxy port to set,
+        // because a tunnel-mode WARP does not serve one.
+        warp_cli_ok(&["mode", "warp"])
+            .map_err(|reason| format!("WARP would not switch to tunnel mode: {reason}"))?;
+    }
 
-    // The mode is checked rather than assumed: a WARP left in tunnel mode
-    // sends the machine's own traffic through Cloudflare, which is the
-    // one thing this module must never cause.
+    // The mode is checked rather than assumed: a WARP left in the other
+    // mode is not what the node was set up with, and saying so is better
+    // than a node that quietly does something else.
     match current_mode() {
-        Some(mode) if canonical_mode(&mode) == WANTED_MODE => {}
-        Some(mode) => {
+        Some(current) if canonical_mode(&current) == mode.warp_cli_name() => {}
+        Some(current) => {
             return Err(format!(
-                "WARP says it is in {mode} mode, not {WANTED_MODE} mode. \
-                 Its own traffic must not be routed through it: set it back with \
-                 `warp-cli --accept-tos mode proxy`."
+                "WARP says it is in {current} mode, not {} mode. \
+                 Set it back with `warp-cli --accept-tos mode {}`.",
+                mode.as_str(),
+                mode.warp_cli_name()
             ));
         }
         None => {
             return Err(
                 "could not read WARP's mode (`warp-cli --accept-tos settings` said nothing \
-                 useful). Refusing to continue, because WARP must not be left in tunnel mode."
+                 useful). Refusing to continue, because the mode has to be the one that was \
+                 asked for."
                     .to_string(),
             );
         }
@@ -187,10 +280,18 @@ fn registered() -> bool {
 }
 
 /// Keep the mode the machine had, so the uninstaller can give it back.
+///
+/// It is kept only the FIRST time: a re-install finds the mode the node
+/// switched the machine to, and writing that down as the mode to restore
+/// would leave a machine that was in tunnel mode stuck in proxy mode after
+/// an uninstall.
 fn remember_mode() {
     let Some(mode) = current_mode() else {
         return;
     };
+    if Path::new(MODE_FILE).exists() {
+        return;
+    }
     if let Err(reason) = write_state(MODE_FILE, &format!("{mode}\n")) {
         log::warn(&format!(
             "could not keep WARP's previous mode for later: {reason}"
@@ -299,5 +400,36 @@ mod tests {
     fn the_mode_ignores_what_is_not_a_mode() {
         assert_eq!(mode_from_settings(""), None);
         assert_eq!(mode_from_settings("Mode:\n"), None);
+    }
+
+    #[test]
+    fn a_mode_is_read_from_the_name_it_was_given() {
+        assert_eq!(Mode::parse("proxy"), Some(Mode::Proxy));
+        assert_eq!(Mode::parse("Proxy"), Some(Mode::Proxy));
+        assert_eq!(Mode::parse("warpproxy"), Some(Mode::Proxy));
+        assert_eq!(Mode::parse("tunnel"), Some(Mode::Tunnel));
+        assert_eq!(Mode::parse("TUNNEL"), Some(Mode::Tunnel));
+        // "warp" is what warp-cli calls tunnel mode, and it is what a
+        // machine in tunnel mode reports.
+        assert_eq!(Mode::parse("warp"), Some(Mode::Tunnel));
+        assert_eq!(Mode::parse(""), None);
+        assert_eq!(Mode::parse("dns"), None);
+    }
+
+    #[test]
+    fn only_proxy_mode_offers_a_separate_warp_exit() {
+        // A tunnel-mode WARP does not listen on a port, so there is nothing
+        // for the hub to connect to: offering one would advertise an exit
+        // that can never answer.
+        assert!(Mode::Proxy.offers_warp_exit());
+        assert!(!Mode::Tunnel.offers_warp_exit());
+    }
+
+    #[test]
+    fn the_modes_are_named_the_way_warp_cli_names_them() {
+        assert_eq!(Mode::Proxy.warp_cli_name(), "proxy");
+        assert_eq!(Mode::Tunnel.warp_cli_name(), "warp");
+        assert_eq!(Mode::Proxy.as_str(), "proxy");
+        assert_eq!(Mode::Tunnel.as_str(), "tunnel");
     }
 }
