@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Write a file with a mode, atomically.
@@ -16,19 +16,49 @@ pub fn write_file(path: &Path, content: &str, mode: u32) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     }
-    let tmp: PathBuf = path.with_extension("tmp-write");
+    // A unique temp name, created O_EXCL. `<path>.tmp-write` was fixed, so two
+    // writers shared it - and the installer runs as root, so a name anything
+    // else can predict in a shared directory is a name anything else can
+    // replace with a symlink before the rename follows it.
+    let tmp = unique_temp_path(path)?;
     {
-        let mut file = fs::File::create(&tmp)
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            // The mode lives in the open flags: the file holds key material
+            // (a WireGuard private key, a SOCKS password) and chmod-after-
+            // write leaves it at the umask's 0644 until the chmod lands.
+            .mode(mode)
+            .open(&tmp)
             .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
-        file.write_all(content.as_bytes())
-            .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+        // A re-created file keeps the mode it had; set it explicitly too, so a
+        // pre-existing 0644 file is narrow rather than briefly world-readable.
         file.set_permissions(fs::Permissions::from_mode(mode))
             .map_err(|e| format!("could not set the mode on {}: {e}", tmp.display()))?;
+        file.write_all(content.as_bytes())
+            .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("could not flush {}: {e}", tmp.display()))?;
     }
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("could not replace {}: {e}", path.display())
     })
+}
+
+/// A sibling of `path` that nothing else is using.
+fn unique_temp_path(path: &Path) -> Result<PathBuf, String> {
+    let pid = std::process::id();
+    for attempt in 0..64u32 {
+        let candidate = path.with_extension(format!("tmp-{pid}-{attempt}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "could not find a free temp name beside {}",
+        path.display()
+    ))
 }
 
 /// Write a file that is meant to be run.
