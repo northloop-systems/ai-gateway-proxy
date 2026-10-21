@@ -410,10 +410,14 @@ mod tests {
 
     #[test]
     fn a_disconnected_tunnel_is_not_counted_as_connected() {
-        assert!(status_says_connected("Status update: Connected\nNetwork: healthy"));
+        assert!(status_says_connected(
+            "Status update: Connected\nNetwork: healthy"
+        ));
         assert!(!status_says_connected("Status update: Disconnected"));
         assert!(!status_says_connected("Status update: Connecting"));
-        assert!(!status_says_connected("Unable to connect to the CloudflareWARP daemon"));
+        assert!(!status_says_connected(
+            "Unable to connect to the CloudflareWARP daemon"
+        ));
         assert!(!status_says_connected(""));
     }
 
