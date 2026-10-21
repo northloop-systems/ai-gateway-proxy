@@ -179,6 +179,7 @@ pub fn run(options: &InstallOptions) -> Result<(), String> {
         socks_user: generate_socks_user(),
         socks_pass: generate_socks_password(),
         ports: exit_ports(&ports, warp_mode),
+        warp_mode: warp_mode.as_str().to_string(),
     };
     let response = hub.register(&request)?;
     if response.status != "ok" {

@@ -20,8 +20,16 @@ pub struct RegisterRequest {
     pub socks_user: String,
     pub socks_pass: String,
     /// The exits this node offers, as (name, port): ("tor", 9050),
-    /// ("warp", 40000), ("direct", 1080).
+    /// ("warp", 40000), ("direct", 1080). A node in WARP tunnel mode has no
+    /// WARP exit of its own, so it offers two.
     pub ports: Vec<(String, i64)>,
+    /// How the node uses WARP: "proxy" or "tunnel".
+    ///
+    /// The hub keeps it with the node because it is what says whose address
+    /// the node's own traffic leaves on: in tunnel mode WARP carries the
+    /// machine's traffic and its DNS, so the machine's address is a WARP
+    /// address.
+    pub warp_mode: String,
 }
 
 impl std::fmt::Debug for RegisterRequest {
@@ -59,6 +67,7 @@ impl RegisterRequest {
             ("public_ip", json::s(&self.public_ip)),
             ("socks_user", json::s(&self.socks_user)),
             ("socks_pass", json::s(&self.socks_pass)),
+            ("warp_mode", json::s(&self.warp_mode)),
         ])
     }
 }
@@ -178,6 +187,7 @@ mod tests {
                 ("warp".to_string(), 40000),
                 ("direct".to_string(), 1080),
             ],
+            warp_mode: "proxy".to_string(),
         }
     }
 
@@ -186,8 +196,18 @@ mod tests {
         let body = sample().to_json().write();
         assert_eq!(
             body,
-            r#"{"hostname":"laptop","version":"3.0","wireguard_public_key":"hJGNPBFrDxKp8CmuAixj0D5L9lJ0V4yJ0V4yJ0V4yJ0=","ports":{"tor":9050,"warp":40000,"direct":1080},"public_ip":"203.0.113.7","socks_user":"proxyuser","socks_pass":"s3cr3tpassword"}"#
+            r#"{"hostname":"laptop","version":"3.0","wireguard_public_key":"hJGNPBFrDxKp8CmuAixj0D5L9lJ0V4yJ0V4yJ0V4yJ0=","ports":{"tor":9050,"warp":40000,"direct":1080},"public_ip":"203.0.113.7","socks_user":"proxyuser","socks_pass":"s3cr3tpassword","warp_mode":"proxy"}"#
         );
+    }
+
+    #[test]
+    fn the_request_carries_the_warp_mode_the_hub_needs() {
+        // The hub keeps it with the node, because it is what says whose
+        // address the node's own traffic leaves on.
+        let mut request = sample();
+        request.warp_mode = "tunnel".to_string();
+        let body = request.to_json().write();
+        assert!(body.contains(r#""warp_mode":"tunnel""#), "{body}");
     }
 
     #[test]
