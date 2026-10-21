@@ -4,13 +4,17 @@
 //!
 //!   1. the packages, so the rest of the work has tools to do it with
 //!   2. Tor, which is local and cannot break anything else
-//!   3. WARP, which is the step that can break the machine - so the
+//!   3. the keypair and the preflight, so a token that is refused costs
+//!      the operator a paste and not a changed machine
+//!   4. WARP, which is the step that can break the machine - so the
 //!      resolver is remembered first, and put back immediately afterwards
-//!   4. the keypair, then the preflight, then the registration
-//!   5. the tunnel, the units, and the services
+//!   5. the registration, then the tunnel, the units, and the services
 //!
 //! The preflight comes before anything is written to the machine: a token
-//! that is refused should cost the operator a paste, not a re-image.
+//! that is refused should cost the operator a paste, not a re-image. That
+//! mattered less when WARP was only being turned into a proxy; in tunnel
+//! mode the switch takes over the machine's traffic and its DNS, and
+//! refusing a token must not cost the operator their network.
 
 use crate::cli::InstallOptions;
 use crate::fs_util;
@@ -113,6 +117,36 @@ pub fn run(options: &InstallOptions) -> Result<(), String> {
         log::warn(&format!("Tor could not be configured: {message}"));
     }
 
+    // The keypair and the preflight come BEFORE anything is written to the
+    // machine, and that ordering matters more than it used to.
+    //
+    // In WARP tunnel mode the switch takes over the machine's traffic AND
+    // its DNS - it is the step that can leave a laptop unable to reach
+    // anything. A token that is refused should cost the operator a paste,
+    // not a re-image: so the token is proven first, and the machine's
+    // network is only changed once the hub has accepted it.
+    log::step("Generating WireGuard keypair...");
+    let keypair = wireguard::KeyPair::generate()?;
+
+    // The preflight: the token decides which node this machine is, and the
+    // hub's answer is the name to register under.
+    let hub = Hub::new(&options.server_host, &options.token);
+    log::step("Verifying connectivity...");
+    let node_name = match hub.whoami() {
+        Ok(name) => {
+            log::step(&format!("This token is bound to node '{name}'"));
+            name
+        }
+        Err(message) => {
+            return Err(format!(
+                "the hub would not accept this token: {message}\n\
+                 Check the token, and that this machine can reach {}.",
+                options.server_host
+            ));
+        }
+    };
+    let node_name = options.node_name.clone().unwrap_or(node_name);
+
     // WARP is the step that can take the machine's resolver away with it,
     // so what the machine was using is remembered BEFORE the switch - and
     // written down, because the moment it is needed again is days later,
@@ -147,28 +181,6 @@ pub fn run(options: &InstallOptions) -> Result<(), String> {
     } else {
         log::step("WARP is not available for this distribution; skipping it.");
     }
-
-    log::step("Generating WireGuard keypair...");
-    let keypair = wireguard::KeyPair::generate()?;
-
-    // The preflight: the token decides which node this machine is, and the
-    // hub's answer is the name to register under.
-    let hub = Hub::new(&options.server_host, &options.token);
-    log::step("Verifying connectivity...");
-    let node_name = match hub.whoami() {
-        Ok(name) => {
-            log::step(&format!("This token is bound to node '{name}'"));
-            name
-        }
-        Err(message) => {
-            return Err(format!(
-                "the hub would not accept this token: {message}\n\
-                 Check the token, and that this machine can reach {}.",
-                options.server_host
-            ));
-        }
-    };
-    let node_name = options.node_name.clone().unwrap_or(node_name);
 
     log::step("Registering with the hub...");
     let request = RegisterRequest {
