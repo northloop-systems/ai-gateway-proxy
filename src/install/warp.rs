@@ -210,7 +210,17 @@ pub fn configure(mode: Mode, port: u16) -> Result<(), String> {
 
     if run::have("systemctl") {
         run::try_run("systemctl", &["enable", "warp-svc"]);
-        run::try_run("systemctl", &["restart", "warp-svc"]);
+        // A daemon that is ALREADY running is left running. Restarting it
+        // costs the machine its network for as long as it takes to come
+        // back, and in TUNNEL mode the machine's network IS WARP's tunnel
+        // - so restarting it here cuts the very line this installer
+        // registers over a moment later. Measured on a tunnel-mode node:
+        // the unconditional restart killed the connection and the hub
+        // registration timed out fifteen seconds later with WARP still
+        // coming back up, which looked like a dead hub and was this.
+        if !service_active("warp-svc") {
+            run::try_run("systemctl", &["restart", "warp-svc"]);
+        }
     }
 
     match warp_cli(&["connect"]) {
@@ -224,7 +234,64 @@ pub fn configure(mode: Mode, port: u16) -> Result<(), String> {
         Err(reason) => log::warn(&format!("could not ask WARP to connect: {reason}")),
     }
 
+    // "Asked it to connect" is not the same as connected, and the caller
+    // registers with the hub as soon as this returns - which in tunnel
+    // mode is a request that can only travel THROUGH WARP. Waiting here
+    // is what stops the registration racing the tunnel it needs.
+    if !await_connected(CONNECT_WAIT) {
+        log::warn(&format!(
+            "WARP is still connecting after {}s; the exit comes up on its own once it \
+             is. The node's own tunnel does not depend on it.",
+            CONNECT_WAIT.as_secs()
+        ));
+    }
+
     Ok(())
+}
+
+/// How long to wait for WARP to report itself connected after being asked.
+const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Does `warp-cli status` say the tunnel is up?
+fn connected() -> bool {
+    match warp_cli(&["status"]) {
+        Ok(out) => out.ok() && status_says_connected(&out.stdout),
+        Err(_) => false,
+    }
+}
+
+/// Read `warp-cli status` output.
+///
+/// The capital matters: "Disconnected" contains "connected" but not
+/// "Connected", so a case-insensitive match would call a down tunnel up -
+/// and the whole point of waiting is to know the difference.
+fn status_says_connected(stdout: &str) -> bool {
+    stdout.contains("Connected")
+}
+
+/// Wait until warp-cli reports connected, or the time runs out.
+///
+/// A machine already connected answers on the first pass, so the wait
+/// costs nothing when there is nothing to wait for.
+fn await_connected(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if connected() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// Is a systemd unit running right now?
+fn service_active(unit: &str) -> bool {
+    match run::run("systemctl", &["is-active", unit]) {
+        Ok(out) => out.ok() && out.stdout.trim() == "active",
+        Err(_) => false,
+    }
 }
 
 /// The mode WARP is in, as warp-cli reports it.
@@ -340,6 +407,15 @@ fn warp_cli_ok(args: &[&str]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_disconnected_tunnel_is_not_counted_as_connected() {
+        assert!(status_says_connected("Status update: Connected\nNetwork: healthy"));
+        assert!(!status_says_connected("Status update: Disconnected"));
+        assert!(!status_says_connected("Status update: Connecting"));
+        assert!(!status_says_connected("Unable to connect to the CloudflareWARP daemon"));
+        assert!(!status_says_connected(""));
+    }
 
     #[test]
     fn the_mode_is_read_out_of_the_settings() {
