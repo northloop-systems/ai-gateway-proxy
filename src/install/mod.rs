@@ -130,7 +130,9 @@ pub fn run(options: &InstallOptions) -> Result<(), String> {
 
     // The preflight: the token decides which node this machine is, and the
     // hub's answer is the name to register under.
-    let hub = Hub::new(&options.server_host, &options.token);
+    // A refused address stops the install here, before anything on the
+    // machine has changed.
+    let hub = Hub::new(&options.server_host, &options.token)?;
     log::step("Verifying connectivity...");
     let node_name = match hub.whoami() {
         Ok(name) => {

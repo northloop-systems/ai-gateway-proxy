@@ -54,11 +54,22 @@ impl std::fmt::Debug for Hub {
 
 impl Hub {
     /// The hub at `server_host`, and the token to use with it.
-    pub fn new(server_host: &str, token: &str) -> Hub {
-        Hub {
-            base: base_url(server_host),
-            token: token.to_string(),
+    ///
+    /// Fails when the address is one this client will not talk to - a plain
+    /// `http://` URL that is not loopback, because every request carries the
+    /// node's token in a header.
+    pub fn new(server_host: &str, token: &str) -> Result<Hub, String> {
+        let base = base_url(server_host);
+        if base.is_empty() && !server_host.trim().is_empty() {
+            return Err(format!(
+                "refusing {server_host:?}: this client sends the node's token in a header, \
+                 so the hub must be https:// (or a loopback address for a local hub)"
+            ));
         }
+        Ok(Hub {
+            base,
+            token: token.to_string(),
+        })
     }
 
     /// The node name the token is bound to.
@@ -390,13 +401,24 @@ fn bound_label(value: &Json) -> Option<String> {
 
 /// The hub's base URL.
 ///
-/// The caller usually has a host name, which becomes `https://host/v1`. A
-/// full URL is accepted too, so a caller that already knows the base does
-/// not have to take it apart.
+/// The caller usually gives a host name, which becomes `https://host/v1`. An
+/// `https://` URL is accepted too, so a caller that already knows the base
+/// does not have to take it apart.
+///
+/// `http://` is refused, except for a loopback host. Every request this client
+/// makes carries the node's PROXY TOKEN in an `Authorization` header, and over
+/// plain HTTP that header is readable by anything on the path - which is the
+/// whole point of the tunnel it is setting up. A dev hub on the same machine
+/// still works, so the check has to be about the HOST, not the scheme alone.
 fn base_url(server_host: &str) -> String {
     let host = server_host.trim().trim_end_matches('/');
     if host.is_empty() {
         return String::new();
+    }
+    if let Some(rest) = host.strip_prefix("http://") {
+        if !is_loopback_host(rest) {
+            return String::new();
+        }
     }
     if host.starts_with("http://") || host.starts_with("https://") {
         if host.ends_with("/v1") {
@@ -407,6 +429,18 @@ fn base_url(server_host: &str) -> String {
     } else {
         format!("https://{host}/v1")
     }
+}
+
+/// True when the host part of a URL points at this machine.
+fn is_loopback_host(rest: &str) -> bool {
+    let authority = rest.split('/').next().unwrap_or("");
+    // strip a port, and any IPv6 brackets
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1") || host.starts_with("127.")
 }
 
 /// Is this a node id the hub would accept?
@@ -674,7 +708,24 @@ mod tests {
     fn a_base_url_is_left_alone() {
         assert_eq!(base_url("https://hub.example/v1"), "https://hub.example/v1");
         assert_eq!(base_url("https://hub.example"), "https://hub.example/v1");
-        assert_eq!(base_url("http://hub.example/v1/"), "http://hub.example/v1");
+    }
+
+    #[test]
+    fn plain_http_is_refused_off_loopback() {
+        // The token rides in a header on every call, so plain http to another
+        // machine puts it on the wire in clear text.
+        assert_eq!(base_url("http://hub.example/v1/"), "");
+        assert!(Hub::new("http://hub.example", "tok").is_err());
+        // a local hub for testing still works
+        assert_eq!(
+            base_url("http://127.0.0.1:8001"),
+            "http://127.0.0.1:8001/v1"
+        );
+        assert_eq!(
+            base_url("http://localhost:8001/v1"),
+            "http://localhost:8001/v1"
+        );
+        assert!(Hub::new("http://127.0.0.1:8001", "tok").is_ok());
     }
 
     #[test]
@@ -697,7 +748,7 @@ mod tests {
 
     #[test]
     fn the_hub_never_prints_its_token() {
-        let hub = Hub::new("hub.example", "tok_secret");
+        let hub = Hub::new("hub.example", "tok_secret").expect("valid hub");
         let text = format!("{hub:?}");
         assert!(!text.contains("tok_secret"), "{text}");
         assert!(text.contains("redacted"), "{text}");
